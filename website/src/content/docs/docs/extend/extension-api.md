@@ -38,7 +38,7 @@ Later registrations win. Hunk's own `.mts` and `.cts` mappings cannot be overrid
 
 ## `hunk.registerVcsAdapter(adapter)`
 
-Contribute an additional version-control backend — the same call Hunk's own bundled Git, Jujutsu, and Sapling backends make. An adapter declares `detect`, its `operations` (`working-tree-diff`, `revision-show`, `stash-show`), and optionally detection priority, watch support, exact file sources, extra files, and rich user-fixable failures.
+Contribute an additional version-control backend — the same call Hunk's own bundled Arc, Git, Jujutsu, and Sapling backends make. An adapter declares `detect`, its `operations` (`working-tree-diff`, `revision-show`, `stash-show`), and optionally detection priority, watch support, exact file sources, extra files, and rich user-fixable failures.
 
 Full contract: [VCS adapters](/docs/extend/vcs-adapters/).
 

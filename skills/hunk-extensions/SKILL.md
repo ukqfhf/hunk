@@ -77,7 +77,7 @@ its manifest declares several entries, in which case each entry is its own
 extension named by its own stem (numeric suffix on collision). The id is the
 namespace it owns: commands are `<id>.<commandId>`, sidebar views
 `<id>:<viewId>`, config `[extension.<id>]`. Ids match
-`/^[A-Za-z0-9][A-Za-z0-9_-]*$/`; `hunk`, `git`, `jj`, and `sl` are reserved. A
+`/^[A-Za-z0-9][A-Za-z0-9_-]*$/`; `hunk`, `arc`, `git`, `jj`, and `sl` are reserved. A
 bad or duplicate id is skipped with a startup notice.
 
 ## Pick the touchpoint

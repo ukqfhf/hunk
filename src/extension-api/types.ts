@@ -3,7 +3,7 @@
  *
  * This module imports nothing on purpose. Whole-program declaration emission
  * ships every file the entry point reaches, so any import here would publish a
- * slice of Hunk's internals — Pierre's diff types, the git/jj/sl backends —
+ * slice of Hunk's internals — Pierre's diff types, the git/jj/sl/arc backends —
  * into the package an extension author typechecks against. Keeping the contract
  * self-contained keeps the shipped `.d.ts` tree to this file and its barrel.
  *

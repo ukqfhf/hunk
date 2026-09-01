@@ -89,7 +89,7 @@ The id is also the namespace your extension owns: its commands are
 `<id>.<commandId>` and its sidebar views `<id>:<viewId>`. So the id has to be
 spelled like a name — starting with a letter or digit, then letters, digits,
 `-`, or `_`. A dot or a colon would make those composed ids ambiguous, and
-`hunk`, `git`, `jj`, and `sl` are reserved for what Hunk ships. An extension
+`hunk`, `arc`, `git`, `jj`, and `sl` are reserved for what Hunk ships. An extension
 whose id breaks a rule is skipped with a startup notice naming the file; rename
 it and it loads. If two discovery sources offer the same id, the first in
 [source order](#where-hunk-looks-for-extensions) loads and the other is skipped the
@@ -105,7 +105,7 @@ repository's own README.
 
 ## Bundled extensions
 
-Every VCS backend Hunk ships — **Git, Jujutsu, and Sapling** — is an extension,
+Every VCS backend Hunk ships — **Arc, Git, Jujutsu, and Sapling** — is an extension,
 and so is the **built-in file-navigation sidebar**. They live in
 `src/extensions/default/`, are compiled into the binary, and register through
 the same `hunk.registerVcsAdapter` and `hunk.registerSidebarView` this guide
@@ -231,7 +231,7 @@ mappings cannot be overridden; attempts are skipped with a notice.
 ### `hunk.registerVcsAdapter(adapter)`
 
 Contribute an additional VCS backend. This is the same call Hunk's own bundled
-Git, Jujutsu, and Sapling backends make.
+Arc, Git, Jujutsu, and Sapling backends make.
 
 ```ts
 hunk.registerVcsAdapter({
@@ -254,7 +254,7 @@ hunk.registerVcsAdapter({
 });
 ```
 
-The ids Hunk ships with — `git`, `jj`, and `sl` — are reserved. An adapter that
+The ids Hunk ships with — `arc`, `git`, `jj`, and `sl` — are reserved. An adapter that
 reuses one is skipped with a notice.
 
 `operations` is optional and may implement any of `working-tree-diff`,
@@ -291,13 +291,15 @@ carries two sets of markers.
 | ------------------------ | -------------------------------------------- |
 | bundled `jj`             | 200                                          |
 | bundled `sl`             | 100                                          |
+| bundled `arc`            | 50                                           |
 | bundled `git`            | 0 (`HUNK_CORE_VCS_DETECTION_PRIORITY`)       |
 | your adapter, by default | -100 (`HUNK_DEFAULT_VCS_DETECTION_PRIORITY`) |
 
 Higher is consulted first; equal priorities fall back to registration order.
 jj and Sapling sit above Git because a colocated jj repository — or a Sapling
 repository created with `sl init --git` — also carries Git metadata, and the
-Git view is the wrong one.
+Git view is the wrong one. Arc also sits above Git so an Arc checkout wins when
+Git-compatible metadata is present at the same root.
 
 The default puts your adapter below Git, so installing an extension never
 silently changes how an existing repository is reviewed. Set
@@ -467,7 +469,7 @@ Hunk detects this structurally — an object whose `name` is
 `"HunkExtensionUserError"` with an optional `suggestions` array of strings — so a
 plain-JavaScript extension, or one bundling its own copy of the class, is
 treated the same way. `HUNK_EXTENSION_USER_ERROR_NAME` is exported if you would
-rather not hard-code the string. Hunk's own bundled Git, Jujutsu, and Sapling
+rather not hard-code the string. Hunk's own bundled Arc, Git, Jujutsu, and Sapling
 backends raise their failures exactly this way.
 
 ### `hunk.registerSidebarView(view)`
@@ -1449,7 +1451,7 @@ some_key = "some value"
 `[extensions] enabled` layers like every other option: a repo `.hunk/config.toml`
 overrides your user config. `--no-extensions` is a hard off switch that no config
 layer can re-enable. Both govern **user** extensions only — Hunk's bundled
-Git, Jujutsu, and Sapling backends load either way. `[extensions] paths` from a repo
+Arc, Git, Jujutsu, and Sapling backends load either way. `[extensions] paths` from a repo
 config is trust-gated the same way `.hunk/extensions` is, because it is
 repo-controlled either way.
 

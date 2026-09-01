@@ -44,11 +44,11 @@ hunk show HEAD~2 -- README.md src/ui
 
 ## Review a stash
 
-Git repositories can open a stash directly:
+Git and Arc repositories can open a stash directly:
 
 ```bash
 hunk stash show
 hunk stash show stash@{2}
 ```
 
-Staging areas and stashes are Git-only. Hunk reports a focused error if these operations are requested under a VCS that does not support them.
+Git and Arc support staging areas and stashes. Hunk reports a focused error if these operations are requested under a VCS that does not support them.

@@ -284,7 +284,7 @@ describe("registerVcsAdapter with junk", () => {
 
   test("built-in ids stay reserved however an extension asks for them", () => {
     const { registry } = loadFactory((hunk: { registerVcsAdapter: (a: unknown) => void }) => {
-      for (const id of ["git", "jj", "sl"]) {
+      for (const id of ["git", "jj", "sl", "arc"]) {
         hunk.registerVcsAdapter({ id, name: id, detect: () => null });
       }
       hunk.registerVcsAdapter({ id: "hg", name: "Mercurial", detect: () => null });
@@ -296,7 +296,7 @@ describe("registerVcsAdapter with junk", () => {
     });
 
     expect(applied.vcsAdapters.map((adapter) => adapter.id)).toEqual(["hg"]);
-    expect(applied.issues).toHaveLength(3);
+    expect(applied.issues).toHaveLength(4);
   });
 });
 

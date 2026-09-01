@@ -74,6 +74,21 @@ hunk show HEAD~1               # review an earlier commit
 
 Hunk auto-detects Jujutsu and Sapling checkouts, so `hunk diff [revset]` and `hunk show [revset]` use native revsets inside jj or Sapling workspaces. To override VCS detection, set `vcs = "git"` or `vcs = "jj"` or `vcs = "sl"` in [config](#config).
 
+### Working with Arc
+
+Hunk auto-detects Arc checkouts from `.arcadia.root` or `.arc`. Arc working-tree,
+staged, commit, and stash reviews use native Git-format output:
+
+```bash
+hunk diff
+hunk diff --staged
+hunk show HEAD
+hunk stash show
+```
+
+Arc watch mode polls the selected diff instead of recursively observing the
+entire checkout.
+
 ### Working with raw files and patches
 
 ```bash
@@ -128,7 +143,7 @@ Example:
 ```toml
 theme = "github-dark-default" # any built-in theme id, auto, or custom
 mode = "auto"        # auto, split, stack
-vcs = "git"          # git, jj, sl
+vcs = "git"          # git, jj, sl, arc
 watch = false
 exclude_untracked = false
 line_numbers = true
@@ -144,7 +159,7 @@ Choose a built-in theme, `auto`, or a custom theme with `theme`. See
 [docs/themes.md](docs/themes.md) for automatic selection, custom theme tables,
 syntax scopes, and legacy syntax-table migration.
 
-`exclude_untracked` affects Git/Sapling working-tree `hunk diff` sessions only.
+`exclude_untracked` affects Git, Sapling, and Arc working-tree `hunk diff` sessions only.
 `tab_width` controls source-code tab stops and can be overridden with `-x4` or `--tab-width 4`.
 `prompt_save_view_preferences = false` disables the quit prompt for saving changed view preferences.
 `transparent_background` can also be written as `transparentBackground`.
@@ -210,7 +225,7 @@ release notes.
 Hunk loads plain TypeScript extensions from `~/.config/hunk/extensions/`, from a
 repository's `.hunk/extensions/` (after you explicitly trust that repository),
 and from `--extension <path>` for development. `--no-extensions` turns those off
-for one run; Hunk's own bundled backends (Git, Jujutsu, and Sapling) stay loaded.
+for one run; Hunk's own bundled backends (Arc, Git, Jujutsu, and Sapling) stay loaded.
 
 A Phase 1 extension can contribute themes and file-extension → language
 mappings, add a VCS backend, rewrite the changeset before review (collapse

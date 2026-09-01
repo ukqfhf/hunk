@@ -38,11 +38,16 @@ afterEach(() => {
 });
 
 describe("VCS adapter registry", () => {
-  test("registers Git, Jujutsu, and Sapling operation maps", () => {
+  test("registers every bundled VCS operation map", () => {
     // Every one of these comes from the bundled extension tier: there are no
     // core-registered adapters, so this list is purely an ordering of what the
     // bundled factories registered through `hunk.registerVcsAdapter`.
-    expect(getBuiltInVcsAdapters().map((adapter) => adapter.id)).toEqual(["jj", "sl", "git"]);
+    expect(getBuiltInVcsAdapters().map((adapter) => adapter.id)).toEqual([
+      "jj",
+      "sl",
+      "arc",
+      "git",
+    ]);
     expect(getBuiltInVcsAdapters()).toEqual(
       [...getBundledVcsAdapters()].sort(
         (left, right) => (right.detectionPriority ?? 0) - (left.detectionPriority ?? 0),
@@ -57,6 +62,9 @@ describe("VCS adapter registry", () => {
     expect(getVcsAdapter("sl").operations["working-tree-diff"]).toBeDefined();
     expect(getVcsAdapter("sl").operations["revision-show"]).toBeDefined();
     expect(getVcsAdapter("sl").operations["stash-show"]).toBeUndefined();
+    expect(getVcsAdapter("arc").operations["working-tree-diff"]).toBeDefined();
+    expect(getVcsAdapter("arc").operations["revision-show"]).toBeDefined();
+    expect(getVcsAdapter("arc").operations["stash-show"]).toBeDefined();
   });
 
   test("falls back to the bundled Git backend when config names none", () => {
@@ -68,6 +76,7 @@ describe("VCS adapter registry", () => {
     expect(isVcsId("git")).toBe(true);
     expect(isVcsId("jj")).toBe(true);
     expect(isVcsId("sl")).toBe(true);
+    expect(isVcsId("arc")).toBe(true);
     expect(isVcsId("hg")).toBe(false);
   });
 
@@ -75,13 +84,16 @@ describe("VCS adapter registry", () => {
     expect(() => getVcsAdapter("hg" as VcsAdapter["id"])).toThrow("Unsupported VCS: hg");
   });
 
-  test("orders built-ins by detection priority, jj and Sapling above the Git baseline", () => {
+  test("orders built-ins by detection priority above the Git baseline", () => {
     const priorities = getBuiltInVcsAdapters().map((adapter) => adapter.detectionPriority ?? 0);
     expect(priorities).toEqual([...priorities].sort((left, right) => right - left));
     expect(getVcsAdapter("jj").detectionPriority).toBeGreaterThan(
       getVcsAdapter("git").detectionPriority ?? 0,
     );
     expect(getVcsAdapter("sl").detectionPriority).toBeGreaterThan(
+      getVcsAdapter("git").detectionPriority ?? 0,
+    );
+    expect(getVcsAdapter("arc").detectionPriority).toBeGreaterThan(
       getVcsAdapter("git").detectionPriority ?? 0,
     );
   });
@@ -102,12 +114,12 @@ describe("VCS adapter registry", () => {
         // Built-in ids stay reserved, whatever priority an extension claims.
         createExtensionAdapter("git", 1_000),
       ]).map((adapter) => adapter.id),
-    ).toEqual(["jj", "sl", "git", "hg", "pijul"]);
+    ).toEqual(["jj", "sl", "arc", "git", "hg", "pijul"]);
 
     // An extension that explicitly outranks Git is honored: the user's machine.
     expect(
       resolveVcsAdapters([createExtensionAdapter("hg", 500)]).map((adapter) => adapter.id),
-    ).toEqual(["hg", "jj", "sl", "git"]);
+    ).toEqual(["hg", "jj", "sl", "arc", "git"]);
   });
 
   test("finds repo root candidates through bundled adapter detection", () => {

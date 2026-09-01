@@ -45,7 +45,7 @@ Mark the current line as a full-row highlight or on its line number. `off` resto
 Select the version-control adapter explicitly. An explicit id outranks detection; an id no loaded backend owns falls back to detection with a startup notice.
 
 - **Type:** string
-- **Accepted:** `git`, `jj`, `sl`, or an id a loaded extension backend registers
+- **Accepted:** `git`, `jj`, `sl`, `arc`, or an id a loaded extension backend registers
 - **Built-in default:** detected from the checkout (Git fallback)
 
 ---

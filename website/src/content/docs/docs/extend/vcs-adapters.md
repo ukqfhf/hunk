@@ -3,7 +3,7 @@ title: VCS adapters
 description: Contribute a version-control backend with detection, watch support, exact file sources, and rich failures.
 ---
 
-`hunk.registerVcsAdapter(adapter)` contributes an additional VCS backend. This is the same call Hunk's own bundled Git, Jujutsu, and Sapling backends make.
+`hunk.registerVcsAdapter(adapter)` contributes an additional VCS backend. This is the same call Hunk's own bundled Arc, Git, Jujutsu, and Sapling backends make.
 
 ```ts
 hunk.registerVcsAdapter({
@@ -172,4 +172,4 @@ throw new HunkExtensionUserError("`hunk stash show` is not supported by Mercuria
 });
 ```
 
-Hunk detects this structurally — an object whose `name` is `"HunkExtensionUserError"` with an optional `suggestions` array of strings — so a plain-JavaScript extension, or one bundling its own copy of the class, is treated the same way. `HUNK_EXTENSION_USER_ERROR_NAME` is exported if you would rather not hard-code the string. Hunk's own bundled Git, Jujutsu, and Sapling backends raise their failures exactly this way.
+Hunk detects this structurally — an object whose `name` is `"HunkExtensionUserError"` with an optional `suggestions` array of strings — so a plain-JavaScript extension, or one bundling its own copy of the class, is treated the same way. `HUNK_EXTENSION_USER_ERROR_NAME` is exported if you would rather not hard-code the string. Hunk's own bundled Arc, Git, Jujutsu, and Sapling backends raise their failures exactly this way.

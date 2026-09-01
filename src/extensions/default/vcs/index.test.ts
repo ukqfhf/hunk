@@ -6,7 +6,12 @@ describe("bundled extension tier", () => {
     const { registry, issues } = loadBundledExtensions();
 
     expect(issues).toEqual([]);
-    expect(registry.extensions.map((extension) => extension.id)).toEqual(["jj", "sl", "git"]);
+    expect(registry.extensions.map((extension) => extension.id)).toEqual([
+      "jj",
+      "sl",
+      "arc",
+      "git",
+    ]);
     expect(registry.extensions.every((extension) => extension.origin === "bundled")).toBe(true);
     // Registered, not hand-assembled: each adapter is tagged with the bundled
     // extension that called `hunk.registerVcsAdapter`, exactly like a user one.
@@ -14,6 +19,7 @@ describe("bundled extension tier", () => {
     expect(registry.vcsAdapters.map((entry) => [entry.extensionId, entry.adapter.id])).toEqual([
       ["jj", "jj"],
       ["sl", "sl"],
+      ["arc", "arc"],
       ["git", "git"],
     ]);
   });
@@ -27,10 +33,11 @@ describe("bundled extension tier", () => {
     }
   });
 
-  test("keeps stash review to the one backend that has stashes", () => {
+  test("exposes stash review only on backends that have stashes", () => {
     const byId = new Map(getBundledVcsAdapters().map((adapter) => [adapter.id, adapter]));
 
     expect(byId.get("git")?.operations["stash-show"]).toBeDefined();
+    expect(byId.get("arc")?.operations["stash-show"]).toBeDefined();
     // Neither jj nor Sapling has a stash, so the command must report that rather
     // than crash on a missing operation.
     expect(byId.get("jj")?.operations["stash-show"]).toBeUndefined();

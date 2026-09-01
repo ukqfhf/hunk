@@ -244,9 +244,10 @@ export function createUnsupportedVcsOperationError(
   adapter: VcsAdapter,
   operationKind: VcsReviewOperationKind,
 ) {
-  const supportingAdapter = getBuiltInVcsAdapters().find(
-    (candidate) => candidate.operations?.[operationKind],
-  );
+  const defaultAdapter = getDefaultVcsAdapter();
+  const supportingAdapter = defaultAdapter.operations?.[operationKind]
+    ? defaultAdapter
+    : getBuiltInVcsAdapters().find((candidate) => candidate.operations?.[operationKind]);
   if (operationKind === "stash-show" && supportingAdapter) {
     return new HunkUserError(`\`hunk stash show\` requires ${supportingAdapter.name} VCS mode.`, [
       `Set \`vcs = "${supportingAdapter.id}"\` in Hunk config, then try again.`,

@@ -1,3 +1,4 @@
+import arcExtension from "./arc";
 import gitExtension from "./git";
 import jjExtension from "./jujutsu";
 import slExtension from "./sapling";
@@ -14,7 +15,7 @@ import type { VcsAdapter } from "../../../core/vcs/types";
 /**
  * The bundled extension tier.
  *
- * Every VCS backend Hunk ships — Git, Jujutsu, Sapling — is an extension,
+ * Every VCS backend Hunk ships — Arc, Git, Jujutsu, Sapling — is an extension,
  * registered through the same `registerVcsAdapter` a third-party author calls.
  * There are no core-registered adapters left, which is the point: a capability
  * Hunk ships on cannot quietly outgrow the API it publishes, and Git is the
@@ -57,6 +58,7 @@ interface BundledExtensionDefinition {
 const BUNDLED_EXTENSIONS: readonly BundledExtensionDefinition[] = [
   { id: "jj", factory: jjExtension },
   { id: "sl", factory: slExtension },
+  { id: "arc", factory: arcExtension },
   { id: "git", factory: gitExtension },
 ];
 

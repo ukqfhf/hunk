@@ -1,9 +1,22 @@
 ---
-title: Jujutsu and Sapling
-description: Use native revsets and pager integration in jj and Sapling workspaces.
+title: Arc, Jujutsu, and Sapling
+description: Review Arc changes or use native revsets in jj and Sapling workspaces.
 ---
 
-Hunk detects Git, Jujutsu (`jj`), and Sapling (`sl`) repositories. `hunk diff [target]` and `hunk show [target]` pass native revsets to the detected backend.
+Hunk detects Arc, Git, Jujutsu (`jj`), and Sapling (`sl`) repositories and passes targets to the detected backend.
+
+## Arc
+
+Arc checkouts are detected from `.arcadia.root` or `.arc`. Hunk requests Git-format patches from Arc for each review operation:
+
+```bash
+hunk diff
+hunk diff --staged
+hunk show HEAD
+hunk stash show
+```
+
+Arc watch mode polls the selected diff rather than recursively observing the checkout.
 
 ## Jujutsu
 
@@ -43,7 +56,7 @@ pager = hunk pager
 Set the backend in Hunk config when a checkout is ambiguous:
 
 ```toml
-vcs = "jj" # git, jj, or sl
+vcs = "jj" # git, jj, sl, or arc
 ```
 
-Jujutsu and Sapling do not have Git's staging area, and stash review is Git-only. Their watch mode currently polls rather than observing repository files directly.
+Jujutsu and Sapling do not have Git's staging area or stash review. Arc, Jujutsu, and Sapling watch mode currently polls rather than observing repository files directly.

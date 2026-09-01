@@ -232,7 +232,7 @@ export const CONFIG_REFERENCE_OPTIONS: readonly ConfigReferenceOption[] = [
     key: "vcs",
     property: "vcs",
     type: "string",
-    accepted: "`git`, `jj`, `sl`, or an id a loaded extension backend registers",
+    accepted: "`git`, `jj`, `sl`, `arc`, or an id a loaded extension backend registers",
     defaultValue: "detected from the checkout (Git fallback)",
     description:
       "Select the version-control adapter explicitly. An explicit id outranks detection; an id no loaded backend owns falls back to detection with a startup notice.",

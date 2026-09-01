@@ -47,7 +47,7 @@ describe("CLI entrypoint contracts", () => {
     expect(stdout).toContain("Global options:");
     expect(stdout).toContain("Common review options:");
     expect(stdout).toContain("auto-reload when the current diff input changes");
-    expect(stdout).toContain("Git diff options:");
+    expect(stdout).toContain("VCS diff options:");
     expect(stdout).toContain("Notes:");
     expect(stdout).toContain(
       "Run `hunk <command> --help` for command-specific syntax and options.",

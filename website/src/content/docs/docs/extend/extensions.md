@@ -64,11 +64,11 @@ The **id** is the file stem, or the folder name for `<name>/index.ts` and single
 - sidebar views: `<id>:<viewId>`
 - file previews: `<id>:<viewId>`
 
-Ids start with a letter or digit, then letters, digits, `-`, or `_`. `hunk`, `git`, `jj`, and `sl` are reserved. An invalid id — or a second source offering an already-loaded id — is skipped with a startup notice.
+Ids start with a letter or digit, then letters, digits, `-`, or `_`. `hunk`, `arc`, `git`, `jj`, and `sl` are reserved. An invalid id — or a second source offering an already-loaded id — is skipped with a startup notice.
 
 ## Bundled extensions
 
-Hunk's own Git, Jujutsu, and Sapling backends and the built-in file-navigation sidebar are themselves extensions, registered through the same public API — which is what keeps that API honest. They differ from yours in three ways:
+Hunk's own Arc, Git, Jujutsu, and Sapling backends and the built-in file-navigation sidebar are themselves extensions, registered through the same public API — which is what keeps that API honest. They differ from yours in three ways:
 
 - statically imported, so they load before config resolution picks the session's VCS
 - implicitly trusted, with no `[extension.<id>]` config table
