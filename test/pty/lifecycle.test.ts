@@ -57,32 +57,25 @@ async function waitForExitCode(path: string, timeoutMs = 2_000) {
   throw new Error(`Timed out waiting for an exit code in ${path}.`);
 }
 
-async function stopDaemonsUnder(runtimeDir: string) {
+/** Stop broker daemons already launched by an exited app in its isolated runtime. */
+function stopDaemonsUnder(runtimeDir: string) {
   const daemonDir = join(runtimeDir, "hunk-mcp");
-  const deadline = Date.now() + 2_000;
+  if (!existsSync(daemonDir)) return;
 
-  while (Date.now() < deadline) {
-    if (existsSync(daemonDir)) {
-      const metadataFiles = readdirSync(daemonDir).filter(
-        (entry) => entry.startsWith("daemon-") && entry.endsWith(".json"),
-      );
-      if (metadataFiles.length > 0) {
-        for (const entry of metadataFiles) {
-          try {
-            const { pid } = JSON.parse(readFileSync(join(daemonDir, entry), "utf8")) as {
-              pid?: number;
-            };
-            if (pid && pid > 0) {
-              process.kill(pid, "SIGTERM");
-            }
-          } catch {
-            // Partially written metadata, or a daemon that already exited.
-          }
-        }
-        return;
+  const metadataFiles = readdirSync(daemonDir).filter(
+    (entry) => entry.startsWith("daemon-") && entry.endsWith(".json"),
+  );
+  for (const entry of metadataFiles) {
+    try {
+      const { pid } = JSON.parse(readFileSync(join(daemonDir, entry), "utf8")) as {
+        pid?: number;
+      };
+      if (pid && pid > 0) {
+        process.kill(pid, "SIGTERM");
       }
+    } catch {
+      // Ignore partially written metadata, or a daemon that already exited.
     }
-    await Bun.sleep(25);
   }
 }
 
@@ -178,42 +171,97 @@ async function waitForPtyOutput(fd: number, pattern: RegExp, timeoutMs = 20_000)
   throw new Error(`Timed out waiting for ${pattern} on the PTY. Saw:\n${text}`);
 }
 
-/** Read child output until the app paints, then leave the stream flowing for teardown. */
-function waitForStreamOutput(stream: NodeJS.ReadableStream, pattern: RegExp, timeoutMs = 20_000) {
-  return new Promise<void>((resolve, reject) => {
-    let text = "";
-    const cleanup = () => {
-      clearTimeout(timer);
-      stream.off("data", onData);
-      stream.off("end", onEnd);
-    };
-    const onData = (chunk: Buffer | string) => {
-      text += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
-      if (pattern.test(text)) {
-        cleanup();
-        stream.resume();
-        resolve();
-      }
-    };
-    const onEnd = () => {
-      cleanup();
-      reject(new Error(`Child output ended before ${pattern}. Saw:\n${text}`));
-    };
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for ${pattern}. Saw:\n${text}`));
-    }, timeoutMs);
-
-    stream.on("data", onData);
-    stream.on("end", onEnd);
-  });
-}
-
 describe("PTY lifecycle", () => {
+  test.skipIf(process.platform === "win32")(
+    "restores a directly launched renderer when SIGTSTP is discarded",
+    async () => {
+      const fixture = harness.createTabbedFilePair();
+      const session = await harness.launchHunk({
+        args: ["diff", "--files", fixture.before, fixture.after, "--mode", "unified"],
+        cwd: fixture.dir,
+      });
+
+      try {
+        await session.waitForText(/before\.txt.*after\.txt/, { timeout: 15_000 });
+        await harness.ensureKeyboardIsLive(session);
+
+        // Tuistory directly launches Hunk as the leader of an orphaned process group. POSIX
+        // discards its SIGTSTP, so Hunk must restore the renderer without waiting for SIGCONT.
+        session.writeRaw("\x1a");
+        await harness.ensureKeyboardIsLive(session);
+
+        expect(await session.text({ immediate: true })).toMatch(/before\.txt.*after\.txt/);
+      } finally {
+        session.close();
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "resumes a suspended job after fg without losing app state",
+    async () => {
+      const fixture = harness.createTabbedFilePair();
+      const hunkCommand = harness.buildHunkCommand([
+        "diff",
+        "--files",
+        fixture.before,
+        fixture.after,
+        "--mode",
+        "unified",
+      ]);
+      const session = await harness.launchShellCommand({
+        command: "exec /bin/bash --noprofile --norc -i",
+        cwd: fixture.dir,
+      });
+
+      try {
+        session.writeRaw("PS1='HUNK_SHELL> '\r");
+        await session.waitForText(/HUNK_SHELL>/, { timeout: 5_000 });
+        session.writeRaw(`${hunkCommand}\r`);
+        await session.waitForText(/before\.txt.*after\.txt/, { timeout: 15_000 });
+        await harness.ensureKeyboardIsLive(session);
+        await harness.pressAndWaitForText(session, "c", /Draft note/, { timeout: 5_000 });
+        await session.type("Keep this note after resume.");
+        await session.press(["ctrl", "s"]);
+        await session.waitForText(/Keep this note after resume\./, { timeout: 5_000 });
+
+        // OpenTUI parses Ctrl-Z in raw mode, so send its control byte instead of SIGTSTP.
+        session.writeRaw("\x1a");
+        await session.waitForText(/\[\d+\][^\n]*(?:Stopped|suspended)/, { timeout: 5_000 });
+        await Bun.sleep(5_000);
+        session.writeRaw("fg\r");
+        await harness.ensureKeyboardIsLive(session);
+        const resumed = await session.text({ immediate: true });
+        expect(resumed).not.toContain("HUNK_SHELL>");
+        expect(resumed).toMatch(/before\.txt.*after\.txt/);
+        expect(resumed).toContain("Keep this note after resume.");
+
+        // A resumed job stays suspendable, so Ctrl-Z is not a one-shot escape hatch. An echoed
+        // shell command proves the stop really happened: the earlier job lines are still on the
+        // normal screen, so matching them again would pass even if Ctrl-Z did nothing.
+        session.writeRaw("\x1a");
+        await session.waitForText(/\[\d+\][^\n]*(?:Stopped|suspended)/, { timeout: 5_000 });
+        session.writeRaw("echo SECOND_SUSPEND_OK\r");
+        await session.waitForText(/HUNK_SHELL> echo SECOND_SUSPEND_OK/, { timeout: 5_000 });
+
+        session.writeRaw("fg\r");
+        await harness.ensureKeyboardIsLive(session);
+        const secondResume = await session.text({ immediate: true });
+        expect(secondResume).not.toContain("SECOND_SUSPEND_OK");
+        expect(secondResume).toContain("Keep this note after resume.");
+      } finally {
+        session.close();
+      }
+    },
+  );
+
   for (const signal of ["SIGHUP", "SIGQUIT", "SIGPIPE"] as const) {
     test.skipIf(process.platform === "win32")(`exits cleanly on ${signal}`, async () => {
       const fixture = harness.createLongWrapFilePair();
       const runtimeDir = harness.createIsolatedConfigHome();
+      // Signal shutdown belongs to the interactive runner; piped stdout intentionally selects
+      // one-shot static output instead.
+      const { master, slave } = openPtyPair();
       const hunkCommand = harness.buildHunkCommand([
         "diff",
         "--files",
@@ -222,7 +270,7 @@ describe("PTY lifecycle", () => {
       ]);
       const child = spawn("/bin/sh", ["-c", `exec ${hunkCommand}`], {
         cwd: fixture.dir,
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: [slave, slave, slave],
         env: {
           ...process.env,
           TERM: "xterm-256color",
@@ -233,16 +281,24 @@ describe("PTY lifecycle", () => {
           HUNK_DISABLE_UPDATE_NOTICE: "1",
         },
       });
-      child.stderr?.resume();
+      closeSync(slave);
+
+      let masterClosed = false;
+      const closeMaster = () => {
+        if (masterClosed) return;
+        masterClosed = true;
+        closeSync(master);
+      };
 
       try {
-        await waitForStreamOutput(child.stdout!, /this is a very long wrapped line/);
+        await waitForPtyOutput(master, /this is a very long wrapped line/);
         process.kill(child.pid!, signal);
 
         await expect(waitForChildExit(child)).resolves.toEqual({ code: 0, signal: null });
       } finally {
+        closeMaster();
         await stopChild(child);
-        await stopDaemonsUnder(runtimeDir);
+        stopDaemonsUnder(runtimeDir);
       }
     });
   }

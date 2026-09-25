@@ -3,7 +3,7 @@ title: Arc, Jujutsu, and Sapling
 description: Review Arc changes or use native revsets in jj and Sapling workspaces.
 ---
 
-Hunk detects Arc, Git, Jujutsu (`jj`), and Sapling (`sl`) repositories and passes targets to the detected backend.
+Hunk detects Arc, Git, Jujutsu (`jj`), and Sapling (`sl`) repositories and passes targets to the detected backend. See the concise [Jujutsu](/jujutsu/) and [Sapling](/sapling/) workflow overviews for a quick introduction.
 
 ## Arc
 

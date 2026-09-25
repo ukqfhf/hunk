@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { createPtyHarness, dragMouse, lineIndexOf, measureKeyScroll } from "./harness";
+import {
+  createPtyHarness,
+  dragMouse,
+  measureKeyScroll,
+  measureMouseWheelScroll,
+  pressKeyRepeat,
+} from "./harness";
 
 const harness = createPtyHarness();
 
@@ -25,19 +31,16 @@ describe("PTY scrolling", () => {
         timeout: 15_000,
       });
 
-      await session.press("]");
-      const bottomAligned = await harness.waitForSnapshot(
+      const bottomAligned = await harness.pressAndWaitForSnapshot(
         session,
+        "]",
         (text) => text.includes("shortLine1 = 10;"),
         5_000,
       );
 
       expect(bottomAligned).not.toContain("line30 = 130");
 
-      for (let iteration = 0; iteration < 4; iteration += 1) {
-        await session.press("up");
-        await session.waitIdle({ timeout: 200 });
-      }
+      await pressKeyRepeat(session, "up", 4);
 
       const movedUp = await harness.waitForSnapshot(
         session,
@@ -72,6 +75,26 @@ describe("PTY scrolling", () => {
     }
   });
 
+  test("a fixed wheel-scroll setting moves exactly that many rows per event", async () => {
+    const fixture = harness.createPagerPatchFixture(60);
+    const session = await harness.launchHunkWithFileBackedStdin({
+      stdinFile: fixture.patchFile,
+      args: ["pager", "--cursor-line", "off", "--wheel-scroll-lines", "3"],
+      cols: 140,
+      rows: 24,
+    });
+
+    try {
+      await session.waitForText(/scroll\.ts/, { timeout: 15_000 });
+      await session.waitIdle({ timeout: 300 });
+
+      expect(await measureMouseWheelScroll(session, "down", 12)).toBe(3);
+      expect(await measureMouseWheelScroll(session, "up", 9)).toBe(-3);
+    } finally {
+      session.close();
+    }
+  });
+
   test("step keys still move one row after a click in the review stream", async () => {
     const fixture = harness.createPinnedHeaderRepoFixture();
     const session = await harness.launchHunk({
@@ -90,7 +113,7 @@ describe("PTY scrolling", () => {
       expect(await measureKeyScroll(session, "j", 12)).toBe(1);
       expect(await measureKeyScroll(session, "k", 12)).toBe(-1);
 
-      const codeRow = lineIndexOf(initial, "line16 = 16;");
+      const codeRow = initial.split("\n").findIndex((line) => /line\d+ = \d+;/.test(line));
       expect(codeRow).toBeGreaterThan(0);
       await session.clickAt(60, codeRow);
       await session.waitIdle({ timeout: 400 });

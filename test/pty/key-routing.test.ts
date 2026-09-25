@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { createPtyHarness, lineIndexOf, sleep } from "./harness";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createPtyHarness, lineIndexOf, pressKeyRepeat, sleep } from "./harness";
 
 const harness = createPtyHarness();
 
@@ -22,10 +24,41 @@ afterEach(() => {
  * Pager mode is where the focused-widget half of this is directly reachable:
  * the review scroll box is focused there by design, and since pager gained the
  * full review controls it also has menus and the theme selector. Review mode's
- * equivalents are covered in `src/ui/AppHost.key-routing.test.tsx`, which hands
+ * equivalents are covered in `packages/hunk/src/ui/AppHost.key-routing.test.tsx`, which hands
  * the scroll box focus directly.
  */
 describe("PTY key routing", () => {
+  test("an alt binding accepts the Escape-prefixed form from legacy terminals", async () => {
+    const configHome = harness.createIsolatedConfigHome();
+    const configDir = join(configHome, "hunk");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "config.toml"),
+      '[keybindings]\n"hunk.app.toggleHelp" = "alt+n"\n',
+    );
+    const fixture = harness.createTwoFileRepoFixture();
+    const session = await harness.launchHunk({
+      args: ["diff", "--mode", "split"],
+      cwd: fixture.dir,
+      cols: 220,
+      rows: 24,
+      env: { XDG_CONFIG_HOME: configHome },
+    });
+
+    try {
+      await session.waitForText(/View\s+Navigate\s+Agent\s+Help/, { timeout: 15_000 });
+      await harness.pressAndWaitForText(session, "f10", /Reload/, { timeout: 5_000 });
+      await session.press("escape");
+      // Keep the menu's lone Escape separate from the next Escape-prefixed input.
+      await harness.waitForSnapshot(session, (text) => !text.includes("Toggle files/filter focus"));
+
+      session.writeRaw("\u001bn");
+      await session.waitForText(/Controls help/, { timeout: 5_000 });
+    } finally {
+      session.close();
+    }
+  });
+
   test("one Escape closes the help overlay without wiping typed filter text", async () => {
     const fixture = harness.createTwoFileRepoFixture();
     const session = await harness.launchHunk({
@@ -40,12 +73,11 @@ describe("PTY key routing", () => {
 
       // Open the help overlay first, then focus the filter and type into it
       // behind the overlay.
-      await session.press("?");
-      await session.waitForText(/Controls help/, { timeout: 5_000 });
+      await harness.pressAndWaitForText(session, "?", /Controls help/, { timeout: 5_000 });
 
-      await session.press("/");
-      await harness.waitForSnapshot(
+      await harness.pressAndWaitForSnapshot(
         session,
+        "tab",
         (text) => text.includes("filter: type to filter files"),
         5_000,
       );
@@ -54,9 +86,9 @@ describe("PTY key routing", () => {
 
       // One Escape must close the overlay and do nothing else. The overlay
       // handler owns the key; the filter input must never see it.
-      await session.press("escape");
-      const afterEscape = await harness.waitForSnapshot(
+      const afterEscape = await harness.pressAndWaitForSnapshot(
         session,
+        "escape",
         (text) => !text.includes("Controls help"),
         5_000,
       );
@@ -84,9 +116,9 @@ describe("PTY key routing", () => {
       expect(initial).toMatch(/▌.*▌/);
 
       // Focus the filter and narrow to one file so the filter is visibly live.
-      await session.press("/");
-      await harness.waitForSnapshot(
+      await harness.pressAndWaitForSnapshot(
         session,
+        "tab",
         (text) => text.includes("filter: type to filter files"),
         5_000,
       );
@@ -97,19 +129,17 @@ describe("PTY key routing", () => {
         5_000,
       );
 
-      // Open the menu bar and pick "Stacked view" from the View menu with Enter.
-      await session.press("f10");
-      await session.waitForText(/Reload/, { timeout: 5_000 });
-      await session.press("right");
-      await harness.waitForSnapshot(
+      // Open the menu bar and pick "Unified view" from the View menu with Enter.
+      await harness.pressAndWaitForText(session, "f10", /Reload/, { timeout: 5_000 });
+      await harness.pressAndWaitForSnapshot(
         session,
-        (text) => text.includes("Split view") && text.includes("Stacked view"),
+        "right",
+        (text) => text.includes("Split view") && text.includes("Unified view"),
         5_000,
       );
-      await session.press("down");
       await session.press("enter");
 
-      // The menu item must run (layout switches to stacked) and the Enter must
+      // The menu item must run (layout switches to unified) and the Enter must
       // stop there: the filter keeps focus and its text instead of submitting.
       const afterEnter = await harness.waitForSnapshot(
         session,
@@ -135,8 +165,7 @@ describe("PTY key routing", () => {
     try {
       await session.waitForText(/View\s+Navigate\s+Agent\s+Help/, { timeout: 15_000 });
 
-      await session.press("c");
-      await session.waitForText(/Draft note/, { timeout: 5_000 });
+      await harness.pressAndWaitForText(session, "c", /Draft note/, { timeout: 5_000 });
 
       // The note composer owns the keyboard; F10 must not pop the menu bar
       // over an in-progress draft.
@@ -170,9 +199,9 @@ describe("PTY key routing", () => {
 
       // Pager focuses the review scroll box, so every key the global chain
       // leaves unconsumed also reaches the scroll box's own arrow scrolling.
-      await session.press("f10");
-      const menuOpen = await harness.waitForSnapshot(
+      const menuOpen = await harness.pressAndWaitForSnapshot(
         session,
+        "f10",
         (text) => text.includes("Quit"),
         5_000,
       );
@@ -181,10 +210,7 @@ describe("PTY key routing", () => {
       const anchorText = menuOpen.split("\n")[anchorRow]?.trim() ?? "";
       expect(anchorText.length).toBeGreaterThan(0);
 
-      for (let press = 0; press < 3; press += 1) {
-        await session.press("down");
-        await session.waitIdle({ timeout: 300 });
-      }
+      await pressKeyRepeat(session, "down", 3);
 
       const afterArrows = await session.text({ immediate: true });
       expect(lineIndexOf(afterArrows, anchorText)).toBe(anchorRow);
@@ -206,9 +232,9 @@ describe("PTY key routing", () => {
       await session.waitForText(/scroll\.ts/, { timeout: 15_000 });
       await session.waitIdle({ timeout: 300 });
 
-      await session.press("t");
-      const selectorOpen = await harness.waitForSnapshot(
+      const selectorOpen = await harness.pressAndWaitForSnapshot(
         session,
+        "t",
         (text) => text.includes("Theme selector"),
         5_000,
       );
@@ -218,11 +244,13 @@ describe("PTY key routing", () => {
       expect(anchorText.length).toBeGreaterThan(0);
 
       // The review's down key moves the selector and must not reach the focused scroll box.
-      await session.press("j");
-      await session.waitIdle({ timeout: 400 });
-
       const selectedBefore = selectorOpen.split("\n").find((line) => line.includes("›"));
-      const afterKey = await session.text({ immediate: true });
+      const afterKey = await harness.pressAndWaitForSnapshot(
+        session,
+        "j",
+        (text) => text.split("\n").find((line) => line.includes("›")) !== selectedBefore,
+        5_000,
+      );
       const selectedAfter = afterKey.split("\n").find((line) => line.includes("›"));
       expect(lineIndexOf(afterKey, anchorText)).toBe(anchorRow);
       expect(afterKey).toContain("Theme selector");
@@ -245,14 +273,13 @@ describe("PTY key routing", () => {
       await session.waitForText(/View\s+Navigate\s+Agent\s+Help/, { timeout: 15_000 });
       await session.waitIdle({ timeout: 300 });
 
-      await session.press("f10");
-      await session.waitForText(/Reload/, { timeout: 5_000 });
+      await harness.pressAndWaitForText(session, "f10", /Reload/, { timeout: 5_000 });
 
       // An open menu is deliberately not fully modal: keys the menu does not
       // use keep falling through to the command table.
-      await session.press("?");
-      const help = await harness.waitForSnapshot(
+      const help = await harness.pressAndWaitForSnapshot(
         session,
+        "?",
         (text) => text.includes("Controls help"),
         5_000,
       );
@@ -276,8 +303,9 @@ describe("PTY key routing", () => {
       await session.waitForText(/View\s+Navigate\s+Agent\s+Help/, { timeout: 15_000 });
       await session.waitIdle({ timeout: 300 });
 
-      await session.press("f10");
-      const menuOpen = await session.waitForText(/Reload/, { timeout: 5_000 });
+      const menuOpen = await harness.pressAndWaitForText(session, "f10", /Reload/, {
+        timeout: 5_000,
+      });
 
       const anchorRow = 20;
       const anchorText = menuOpen.split("\n")[anchorRow]?.trim() ?? "";

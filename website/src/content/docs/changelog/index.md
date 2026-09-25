@@ -11,7 +11,7 @@ head:
   - tag: meta
     attrs:
       property: og:image:alt
-      content: "Hunk changelog — 21 release series · March 2026 – September 2026"
+      content: "Hunk changelog — 22 release series · March 2026 – September 2026"
   - tag: meta
     attrs:
       name: twitter:image
@@ -22,13 +22,21 @@ head:
 
 [RSS](https://hunk.dev/changelog/rss.xml) · [CHANGELOG.md](https://github.com/modem-dev/hunk/blob/main/CHANGELOG.md)
 
+## [Hunk 0.22](/changelog/0.22/)
+
+Latest · September 8, 2026 – September 10, 2026 · 3 releases · 81 changes
+
+Hunk 0.22 turns repository history into a responsive review workspace with commit-range browsing, persistent multiline selections, keyboard-driven threaded notes, and richer extension context.
+
 ## [Hunk 0.21](/changelog/0.21/)
 
-Prerelease · August 30, 2026 – September 1, 2026 · 2 releases · 37 changes
+August 30, 2026 – September 4, 2026 · 4 releases · 77 changes
+
+Hunk 0.21 turns reviews into a richer agent-aware workspace with authenticated live sessions, editable threaded notes, two-revision and two-file comparisons, more responsive navigation, and a broader extension surface.
 
 ## [Hunk 0.20](/changelog/0.20/)
 
-Latest · August 25, 2026 – August 29, 2026 · 2 releases · 14 changes
+August 25, 2026 – August 29, 2026 · 2 releases · 14 changes
 
 Hunk 0.20 adds a one-line installer with conditional checksum verification and self-updates, launches a directory of 12 community extensions, and makes line-level reviewing faster and more precise.
 

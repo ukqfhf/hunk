@@ -392,6 +392,27 @@ export function buildInstallVmJunit(result: InstallVmRunResult) {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="install-vm" tests="${scenarios.length}" failures="${failures}" skipped="${skipped}" time="${time.toFixed(3)}">\n${cases}\n</testsuite>\n`;
 }
 
+/**
+ * Rewrite one absolute path onto the repo's physical prefix without resolving anything below it.
+ *
+ * Containment compares the target against a `realpathSync`-resolved repo root, so the two have to
+ * be spelled the same way or a symlinked ancestor of the repo itself — `/var/folders` on macOS, a
+ * symlinked `$HOME` on Linux — makes every harness-owned path read as foreign. Only the prefix is
+ * canonicalized: each segment below the repo root is left verbatim so a symlink *inside* the tree
+ * survives into the string the caller's symlink walk inspects. Resolving those away would silently
+ * disarm that guard, and a path whose leaf does not exist yet must still be rewritable.
+ */
+function rebaseOnPhysicalRepoRoot(physicalRepoRoot: string, repoRoot: string, target: string) {
+  const absolute = path.resolve(target);
+  for (const root of [repoRoot, physicalRepoRoot]) {
+    const relative = path.relative(path.resolve(root), absolute);
+    if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+      return path.join(physicalRepoRoot, relative);
+    }
+  }
+  return absolute;
+}
+
 /** Resolve one runtime path without following a symlink outside the harness-owned tmp tree. */
 export function assertSafeInstallVmRuntimePath(
   repoRoot: string,
@@ -407,7 +428,12 @@ export function assertSafeInstallVmRuntimePath(
   const physicalRepoRoot = realpathSync(repoRoot);
   const allowedRoot = path.join(physicalRepoRoot, "tmp", "install-vm");
   const resolved = path.resolve(target);
-  const relative = path.relative(allowedRoot, resolved);
+  // Restate the target on the repo's physical prefix so a symlinked ancestor of the repo cannot
+  // make an owned path read as foreign. Segments below the repo root keep their own spelling, so
+  // the walk further down still sees any symlink inside the tree. Only the return value keeps the
+  // caller's original prefix.
+  const physicalResolved = rebaseOnPhysicalRepoRoot(physicalRepoRoot, repoRoot, resolved);
+  const relative = path.relative(allowedRoot, physicalResolved);
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Refusing install VM path outside ${allowedRoot}: ${resolved}`);
   }
@@ -416,7 +442,7 @@ export function assertSafeInstallVmRuntimePath(
   }
 
   let cursor = physicalRepoRoot;
-  for (const segment of path.relative(physicalRepoRoot, resolved).split(path.sep)) {
+  for (const segment of path.relative(physicalRepoRoot, physicalResolved).split(path.sep)) {
     if (!segment) continue;
     cursor = path.join(cursor, segment);
     try {
@@ -467,6 +493,13 @@ export interface DockerRunPaths {
   outputDir: string;
 }
 
+/** Reject paths that Docker's comma-delimited bind syntax cannot represent safely. */
+function assertSafeDockerBindPath(mountPath: string) {
+  if (/[,\0-\x1f\x7f]/.test(mountPath)) {
+    throw new Error(`Unsafe Docker bind path for install VM: ${mountPath}`);
+  }
+}
+
 /** Build the controller image from the same validated image and Node pins used by the guest. */
 export function buildControllerImageCommand(
   image: string,
@@ -497,11 +530,7 @@ export function buildDockerRunCommand(
   scenarioIds: readonly string[],
   hostIdentity: { uid: number; gid: number },
 ) {
-  for (const mountPath of Object.values(paths)) {
-    if (/[,\0-\x1f\x7f]/.test(mountPath)) {
-      throw new Error(`Unsafe Docker bind path for install VM: ${mountPath}`);
-    }
-  }
+  for (const mountPath of Object.values(paths)) assertSafeDockerBindPath(mountPath);
   if (scenarioIds.some((id) => !SCENARIO_ID_PATTERN.test(id))) {
     throw new Error("Unsafe install VM scenario id in Docker command.");
   }
@@ -526,6 +555,43 @@ export function buildDockerRunCommand(
     `--mount=type=bind,src=${paths.cacheDir},dst=/cache`,
     `--mount=type=bind,src=${paths.fixtureDir},dst=/fixtures,readonly`,
     `--mount=type=bind,src=${paths.outputDir},dst=/artifacts`,
+    image,
+  ];
+}
+
+/** Build the least-privilege interactive Docker command for one disposable VM shell. */
+export function buildDockerVmShellCommand(
+  image: string,
+  cacheDir: string,
+  hostIdentity: { uid: number; gid: number },
+  options: { shellInputDir: string; withHunk: boolean },
+) {
+  assertSafeDockerBindPath(cacheDir);
+  assertSafeDockerBindPath(options.shellInputDir);
+  return [
+    "docker",
+    "run",
+    "--rm",
+    "--interactive",
+    "--tty",
+    "--stop-timeout=30",
+    "--cap-drop=ALL",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=CHOWN",
+    "--cap-add=DAC_OVERRIDE",
+    "--device=/dev/kvm",
+    "--device=/dev/net/tun",
+    "--security-opt=no-new-privileges",
+    "--sysctl=net.ipv4.ip_forward=1",
+    "--read-only",
+    "--tmpfs=/tmp:rw,nosuid,nodev,mode=1777",
+    "--tmpfs=/run:rw,nosuid,nodev,mode=755",
+    `--env=HOST_UID=${hostIdentity.uid}`,
+    `--env=HOST_GID=${hostIdentity.gid}`,
+    `--mount=type=bind,src=${cacheDir},dst=/cache`,
+    ...(options.withHunk ? ["--env=WITH_HUNK=1"] : []),
+    `--mount=type=bind,src=${options.shellInputDir},dst=/shell-input,readonly`,
+    "--entrypoint=/opt/install-vm/vm-shell-controller.sh",
     image,
   ];
 }
