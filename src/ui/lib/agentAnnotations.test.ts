@@ -1,11 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { reviewAnnotatedHunkIndices } from "../../core/review/annotations";
 import { createTestDiffFile, lines } from "../../../test/helpers/diff-helpers";
 import { buildLiveComment, resolveCommentTarget } from "../../core/liveComments";
-import {
-  annotationRangeLabel,
-  getAnnotatedHunkIndices,
-  getSelectedAnnotations,
-} from "./agentAnnotations";
+import { annotationRangeLabel, getSelectedAnnotations, inlineNoteTitle } from "./agentAnnotations";
 
 function createContextHeavyHunkFile() {
   const beforeLines = Array.from({ length: 25 }, (_, i) => `line${i + 1}`);
@@ -22,6 +19,14 @@ function createContextHeavyHunkFile() {
 }
 
 describe("agent annotations", () => {
+  test("formats inline note titles without depending on the pane component", () => {
+    expect(inlineNoteTitle({ summary: "Draft", source: "user-draft" }, 0, 1)).toBe("Draft note");
+    expect(inlineNoteTitle({ summary: "Mine", source: "user" }, 0, 1)).toBe("Your note");
+    expect(
+      inlineNoteTitle({ summary: "Agent", source: "agent", author: " Pi\rspoof " }, 1, 3),
+    ).toBe("Pispoof note 2/3");
+  });
+
   test("formats inline note locations with GitHub-style file and side anchors", () => {
     const file = createContextHeavyHunkFile();
 
@@ -71,7 +76,7 @@ describe("agent annotations", () => {
       },
     };
 
-    expect([...getAnnotatedHunkIndices(annotatedFile)]).toEqual([0]);
+    expect([...reviewAnnotatedHunkIndices(annotatedFile)]).toEqual([0]);
     expect(getSelectedAnnotations(annotatedFile, hunk)).toEqual([comment]);
   });
 });

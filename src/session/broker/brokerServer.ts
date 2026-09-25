@@ -1,4 +1,9 @@
-import { createSessionBrokerDaemon, type SessionBrokerController } from "@hunk/session-broker";
+import {
+  SessionBrokerAuthenticator,
+  createSessionBrokerDaemon,
+  type SessionBrokerAuthenticatedControlFacts,
+  type SessionBrokerController,
+} from "@hunk/session-broker";
 import {
   serveSessionBrokerDaemon as serveSessionBrokerDaemonWithBun,
   type RunningSessionBrokerDaemon as RunningBunSessionBrokerDaemon,
@@ -10,21 +15,26 @@ import {
   isLoopbackHost,
   resolveSessionBrokerConfig,
 } from "./brokerConfig";
+import { BrowserReviewServer } from "./browserReviewServer";
 import { createHunkSessionBrokerState, type HunkSessionBrokerState } from "./state";
 import type {
   AppliedCommentBatchResult,
   AppliedCommentResult,
+  AppliedHighlightResult,
   ClearedCommentsResult,
+  ClearedHighlightsResult,
   HunkSessionCommandResult,
   HunkSessionServerMessage,
+  NavigateToHunkToolInput,
   NavigatedSelectionResult,
   ReloadedSessionResult,
   RemovedCommentResult,
 } from "../types";
 import {
+  BrokerCapacityError,
   MAX_HTTP_BODY_BYTES,
   PayloadTooLargeError,
-  readRequestTextWithLimit,
+  readRequestBytesWithLimit,
 } from "@hunk/session-broker-core";
 import { listHunkSessionNotes } from "./projections";
 import {
@@ -34,9 +44,14 @@ import {
   HUNK_SESSION_DAEMON_VERSION,
   type SessionDaemonAction,
   type SessionDaemonCapabilities,
+  type SessionDaemonRequest,
   type SessionDaemonResponse,
 } from "../protocol";
+import { MAX_HUNK_REVIEW_ENVELOPE_BYTES } from "../reviewProtocol";
 import { parseSessionDaemonRequest } from "../protocolSchemas";
+import { hunkSessionProtocolParsers } from "./protocolParsers";
+import { loadOrCreateHunkSessionBrokerCredentials } from "./credentials";
+import { HUNK_SESSION_BROKER_APP_ID, HUNK_SESSION_BROKER_APP_REVISION } from "./appContract";
 
 const DEFAULT_STALE_SESSION_TTL_MS = 45_000;
 const DEFAULT_STALE_SESSION_SWEEP_INTERVAL_MS = 15_000;
@@ -54,6 +69,8 @@ const SUPPORTED_SESSION_ACTIONS: SessionDaemonAction[] = [
   "comment-list",
   "comment-rm",
   "comment-clear",
+  "highlight-add",
+  "highlight-clear",
 ];
 
 export interface ServeSessionBrokerDaemonOptions {
@@ -109,7 +126,7 @@ function hasJsonContentType(request: Request) {
 /** Parse a Host-style value into hostname and optional port pieces. */
 export function parseHostAndPort(value: string) {
   const trimmed = value.trim();
-  if (!trimmed) {
+  if (!trimmed || trimmed.includes(",")) {
     return null;
   }
 
@@ -129,8 +146,10 @@ export function parseHostAndPort(value: string) {
       return null;
     }
 
-    const port = Number.parseInt(rest.slice(1), 10);
-    return Number.isInteger(port) && port > 0 ? { host, port } : null;
+    const rawPort = rest.slice(1);
+    if (!/^[0-9]+$/.test(rawPort)) return null;
+    const port = Number(rawPort);
+    return Number.isInteger(port) && port > 0 && port <= 65_535 ? { host, port } : null;
   }
 
   const colonCount = [...trimmed].filter((character) => character === ":").length;
@@ -140,13 +159,14 @@ export function parseHostAndPort(value: string) {
 
   if (colonCount === 1) {
     const [host, rawPort] = trimmed.split(":");
-    const port = Number.parseInt(rawPort ?? "", 10);
-    return host && Number.isInteger(port) && port > 0 ? { host, port } : null;
+    if (!host || !/^[0-9]+$/.test(rawPort ?? "")) return null;
+    const port = Number(rawPort);
+    return Number.isInteger(port) && port > 0 && port <= 65_535 ? { host, port } : null;
   }
 
-  // Unbracketed IPv6 literals are invalid in Host headers, but accepting the address without a
-  // port keeps validation strict enough for DNS-rebinding while tolerating unusual native clients.
-  return { host: trimmed, port: undefined };
+  // URL authorities require brackets around IPv6 literals; accepting another spelling would make
+  // listener-derived authority comparison ambiguous.
+  return null;
 }
 
 /** Return whether a parsed authority targets an accepted broker host and port. */
@@ -182,6 +202,9 @@ export function validateOriginHeader(request: Request, expectedPort: number, all
   if (!origin) {
     return null;
   }
+  if (origin === "null" || origin.includes(",")) {
+    return jsonError("Origin is not allowed for the local session broker.", 403);
+  }
 
   let url: URL;
   try {
@@ -190,7 +213,15 @@ export function validateOriginHeader(request: Request, expectedPort: number, all
     return jsonError("Origin is not allowed for the local session broker.", 403);
   }
 
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash ||
+    url.origin !== origin
+  ) {
     return jsonError("Origin is not allowed for the local session broker.", 403);
   }
 
@@ -203,11 +234,10 @@ export function validateOriginHeader(request: Request, expectedPort: number, all
   return null;
 }
 
-async function parseJsonRequest(request: Request) {
-  const text = await readRequestTextWithLimit(request, MAX_HTTP_BODY_BYTES);
+function parseJsonRequestBytes(bytes: Uint8Array) {
   let raw: unknown;
   try {
-    raw = JSON.parse(text);
+    raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {
     throw new Error("Expected one JSON request body.");
   }
@@ -215,7 +245,101 @@ async function parseJsonRequest(request: Request) {
   return parseSessionDaemonRequest(raw);
 }
 
-export async function handleSessionApiRequest(state: HunkSessionBrokerState, request: Request) {
+/** Resolve one daemon navigation request into the canonical target sent to the live session. */
+function resolveNavigateCommandInput(
+  state: HunkSessionBrokerState,
+  input: Extract<SessionDaemonRequest, { action: "navigate" }>,
+): NavigateToHunkToolInput {
+  if (input.commentId !== undefined) {
+    const hasConflictingTarget =
+      input.commentDirection !== undefined ||
+      input.filePath !== undefined ||
+      input.hunkNumber !== undefined ||
+      input.side !== undefined ||
+      input.line !== undefined;
+    if (hasConflictingTarget) {
+      throw new Error("navigate commentId cannot be combined with another navigation target.");
+    }
+
+    const comment = state
+      .listComments(input.selector)
+      .find((candidate) => candidate.commentId === input.commentId);
+    if (!comment) {
+      throw new Error(
+        `No live comment with id "${input.commentId}" exists in the selected session.`,
+      );
+    }
+
+    // Exact coordinates let the session reveal the annotated row and derive its containing hunk.
+    return {
+      ...input.selector,
+      filePath: comment.filePath,
+      side: comment.side,
+      line: comment.line,
+    };
+  }
+
+  if (
+    !input.commentDirection &&
+    input.hunkNumber === undefined &&
+    (input.side === undefined || input.line === undefined)
+  ) {
+    throw new Error(
+      "navigate requires commentId, commentDirection, hunkNumber, or both side and line.",
+    );
+  }
+
+  // Exact coordinates take precedence so callers reveal the row rather than only its hunk.
+  const hasExactLineTarget = input.side !== undefined && input.line !== undefined;
+  return {
+    ...input.selector,
+    filePath: input.filePath,
+    hunkIndex:
+      input.hunkNumber !== undefined && !hasExactLineTarget ? input.hunkNumber - 1 : undefined,
+    side: input.side,
+    line: input.line,
+    commentDirection: input.commentDirection,
+  };
+}
+
+/** Map each Hunk action to the generic operation and exact producer command scope it requires. */
+function sessionApiAuthorizationFacts(
+  state: HunkSessionBrokerState,
+  bytes: Uint8Array,
+): SessionBrokerAuthenticatedControlFacts {
+  const input = parseJsonRequestBytes(bytes);
+  if (input.action === "list") return { operation: "list", targetSpecific: false };
+  const sessionId = input.selector.sessionId ?? state.getSession(input.selector).sessionId;
+  if (["get", "context", "review", "comment-list"].includes(input.action)) {
+    return { operation: "get", sessionId, targetSpecific: true };
+  }
+  const commandByAction = {
+    navigate: "navigate_to_hunk",
+    reload: "reload_session",
+    "comment-add": "comment",
+    "comment-apply": "comment_batch",
+    "comment-rm": "remove_comment",
+    "comment-clear": "clear_comments",
+    "highlight-add": "highlight",
+    "highlight-clear": "clear_highlights",
+  } as const;
+  const command = commandByAction[input.action as keyof typeof commandByAction];
+  if (!command) throw new Error("Unknown session API action.");
+  return {
+    operation: "dispatch",
+    sessionId,
+    command,
+    commandVersion: 1,
+    targetSpecific: true,
+  };
+}
+
+export async function handleSessionApiRequest(
+  state: HunkSessionBrokerState,
+  request: Request,
+  bodyBytes?: Uint8Array,
+  resolvedSessionId?: string,
+) {
   if (request.method !== "POST") {
     return jsonError("Session API requests must use POST.", 405);
   }
@@ -225,7 +349,13 @@ export async function handleSessionApiRequest(state: HunkSessionBrokerState, req
   }
 
   try {
-    const input = await parseJsonRequest(request);
+    const parsedInput = parseJsonRequestBytes(
+      bodyBytes ?? (await readRequestBytesWithLimit(request, MAX_HTTP_BODY_BYTES)),
+    );
+    const input: SessionDaemonRequest =
+      resolvedSessionId && parsedInput.action !== "list"
+        ? { ...parsedInput, selector: { sessionId: resolvedSessionId } }
+        : parsedInput;
     let response: SessionDaemonResponse;
 
     switch (input.action) {
@@ -239,8 +369,10 @@ export async function handleSessionApiRequest(state: HunkSessionBrokerState, req
         response = { context: state.getSelectedContext(input.selector) };
         break;
       case "review": {
+        // Patch bodies are read back from the publishing session as review resources, so
+        // this is the one session action whose projection is asynchronous.
         response = {
-          review: state.getSessionReview(input.selector, {
+          review: await state.getSessionReviewWithResources(input.selector, {
             includePatch: input.includePatch,
             includeNotes: input.includeNotes,
           }),
@@ -248,26 +380,12 @@ export async function handleSessionApiRequest(state: HunkSessionBrokerState, req
         break;
       }
       case "navigate": {
-        if (
-          !input.commentDirection &&
-          input.hunkNumber === undefined &&
-          (input.side === undefined || input.line === undefined)
-        ) {
-          throw new Error("navigate requires either hunkNumber or both side and line.");
-        }
-
+        const commandInput = resolveNavigateCommandInput(state, input);
         response = {
           result: await state.dispatchCommand<NavigatedSelectionResult, "navigate_to_hunk">({
             selector: input.selector,
             command: "navigate_to_hunk",
-            input: {
-              ...input.selector,
-              filePath: input.filePath,
-              hunkIndex: input.hunkNumber !== undefined ? input.hunkNumber - 1 : undefined,
-              side: input.side,
-              line: input.line,
-              commentDirection: input.commentDirection,
-            },
+            input: commandInput,
             timeoutMessage: "Timed out waiting for the session to navigate to the requested hunk.",
           }),
         };
@@ -372,6 +490,38 @@ export async function handleSessionApiRequest(state: HunkSessionBrokerState, req
           }),
         };
         break;
+      case "highlight-add":
+        response = {
+          result: await state.dispatchCommand<AppliedHighlightResult, "highlight">({
+            selector: input.selector,
+            command: "highlight",
+            input: {
+              ...input.selector,
+              filePath: input.filePath,
+              side: input.side,
+              line: input.line,
+              start: input.start,
+              end: input.end,
+              tone: input.tone,
+              reveal: input.reveal,
+            },
+            timeoutMessage: "Timed out waiting for the session to apply the highlight.",
+          }),
+        };
+        break;
+      case "highlight-clear":
+        response = {
+          result: await state.dispatchCommand<ClearedHighlightsResult, "clear_highlights">({
+            selector: input.selector,
+            command: "clear_highlights",
+            input: {
+              ...input.selector,
+              filePath: input.filePath,
+            },
+            timeoutMessage: "Timed out waiting for the session to clear the requested highlights.",
+          }),
+        };
+        break;
       default:
         throw new Error("Unknown session API action.");
     }
@@ -380,6 +530,9 @@ export async function handleSessionApiRequest(state: HunkSessionBrokerState, req
   } catch (error) {
     if (error instanceof PayloadTooLargeError) {
       return jsonError(error.message, 413);
+    }
+    if (error instanceof BrokerCapacityError) {
+      return Response.json({ error: error.code, resource: error.resource }, { status: 503 });
     }
 
     return jsonError(error instanceof Error ? error.message : "Unknown session API error.");
@@ -396,29 +549,34 @@ function createHunkBrokerController(
   state: HunkSessionBrokerState,
 ): SessionBrokerController<ListedHunkSession, HunkSessionServerMessage, HunkSessionCommandResult> {
   return {
+    protocolParsers: hunkSessionProtocolParsers,
+    limits: state.limits,
     listSessions: () => state.listSessions(),
     getSession: (selector) => state.getSession(selector),
+    resolveSessionId: (selector) => state.getSession(selector).sessionId,
+    getSessionIds: () => state.listSessions().map((session) => session.sessionId),
     getSessionCount: () => state.getSessionCount(),
     getPendingCommandCount: () => state.getPendingCommandCount(),
-    registerSession: (connection, registrationInput, snapshotInput) =>
-      state.registerSession(connection, registrationInput, snapshotInput),
-    updateSnapshot: (sessionId, snapshotInput) => state.updateSnapshot(sessionId, snapshotInput),
-    markSessionSeen: (sessionId) => state.markSessionSeen(sessionId),
+    registerSession: (connection, registrationInput, snapshotInput, options) =>
+      state.registerSession(connection, registrationInput, snapshotInput, options),
+    updateSnapshot: (connection, sessionId, snapshotInput) =>
+      state.updateSnapshot(connection, sessionId, snapshotInput),
+    markSessionSeen: (connection, sessionId) => state.markSessionSeen(connection, sessionId),
     unregisterConnection: (connection) => state.unregisterSocket(connection),
     pruneStaleSessions: (options) => state.pruneStaleSessions(options),
     dispatchCommand: (options) =>
       state.dispatchCommand<HunkSessionCommandResult, HunkSessionServerMessage["command"]>(
         options as Parameters<HunkSessionBrokerState["dispatchCommand"]>[0],
       ),
-    handleCommandResult: (message) => state.handleCommandResult(message),
+    handleCommandResult: (connection, message) => state.handleCommandResult(connection, message),
     shutdown: (error) => state.shutdown(error),
   };
 }
 
 /** Serve the local session broker daemon and websocket broker transport. */
-export function serveSessionBrokerDaemon(
+export async function serveSessionBrokerDaemon(
   options: ServeSessionBrokerDaemonOptions = {},
-): RunningSessionBrokerDaemon {
+): Promise<RunningSessionBrokerDaemon> {
   const config = resolveSessionBrokerConfig();
   const allowRemote = allowsUnsafeRemoteSessionBroker();
   const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
@@ -426,6 +584,18 @@ export function serveSessionBrokerDaemon(
   const staleSessionSweepIntervalMs =
     options.staleSessionSweepIntervalMs ?? DEFAULT_STALE_SESSION_SWEEP_INTERVAL_MS;
   const state = createHunkSessionBrokerState();
+  const credentials = await loadOrCreateHunkSessionBrokerCredentials();
+  const generation = `h_${crypto.randomUUID().replaceAll("-", "")}_0`;
+  const authenticator = new SessionBrokerAuthenticator({
+    appId: HUNK_SESSION_BROKER_APP_ID,
+    appRevision: HUNK_SESSION_BROKER_APP_REVISION,
+    generation,
+    daemonIdentity: credentials.daemonIdentity,
+    credentials: [credentials.producer, credentials.caller],
+    // A CLI process normally performs capabilities plus one action, then exits. Retire its caller
+    // session quickly so repeated short-lived commands cannot fill the generic retained-session cap.
+    callerSessionTtlMs: 30_000,
+  });
   const daemon = createSessionBrokerDaemon({
     broker: createHunkBrokerController(state),
     capabilities: {
@@ -436,9 +606,27 @@ export function serveSessionBrokerDaemon(
     idleTimeoutMs,
     staleSessionTtlMs,
     staleSessionSweepIntervalMs,
+    appId: HUNK_SESSION_BROKER_APP_ID,
+    appRevision: HUNK_SESSION_BROKER_APP_REVISION,
+    callerAuthenticator: authenticator,
+    helloAuthenticator: authenticator,
+    producerEndpoint: `${config.wsOrigin}${SESSION_BROKER_SOCKET_PATH}`,
+    authorizer: () => true,
+    // Hunk currently keeps audit decisions in-process; the generic hook guarantees only redacted
+    // principal/operation metadata can be wired to a future diagnostic sink.
+    audit: () => undefined,
     paths: {
       socket: SESSION_BROKER_SOCKET_PATH,
     },
+  });
+  // One loopback process serves every attached review, rather than a port per terminal. Authorized
+  // review actions join the daemon's shared finite-control and aggregate body budgets.
+  const browserReview = new BrowserReviewServer(state, {
+    handleActionControl: (request, handler, payloadTooLarge) =>
+      daemon.handleBoundedControl(request, handler, {
+        maxBodyBytes: Math.min(MAX_HUNK_REVIEW_ENVELOPE_BYTES, MAX_HTTP_BODY_BYTES),
+        payloadTooLarge,
+      }),
   });
 
   const server = serveSessionBrokerDaemonWithBun({
@@ -459,25 +647,54 @@ export function serveSessionBrokerDaemon(
 
       const url = new URL(request.url);
 
-      if (url.pathname === "/health") {
-        // Extend the generic health payload with the Hunk-specific companion endpoints that older
-        // CLI clients and debugging workflows still expect to discover from one place.
-        return Response.json({
-          ...daemon.getHealth(),
-          sessionApi: `${config.httpOrigin}${HUNK_SESSION_API_PATH}`,
-          sessionCapabilities: `${config.httpOrigin}${HUNK_SESSION_CAPABILITIES_PATH}`,
-          sessionSocket: `${config.wsOrigin}${SESSION_BROKER_SOCKET_PATH}`,
-        });
+      if (
+        (url.pathname === HUNK_SESSION_CAPABILITIES_PATH ||
+          url.pathname === HUNK_SESSION_API_PATH) &&
+        !request.headers.has("x-session-broker-caller-session")
+      ) {
+        return Response.json(
+          {
+            error: "authentication-required",
+            message:
+              "This Hunk session client must be upgraded to use automatic signed authentication.",
+          },
+          { status: 401 },
+        );
       }
 
       if (url.pathname === HUNK_SESSION_CAPABILITIES_PATH) {
-        return Response.json(sessionCapabilities());
+        return daemon.handleAuthenticatedControl(request, {
+          authenticationFailureOperation: "diagnostics",
+          resolve: () => ({ operation: "diagnostics", targetSpecific: false }),
+          handle: (body) =>
+            request.method === "GET" && body.byteLength === 0
+              ? { body: sessionCapabilities() as never }
+              : {
+                  body: { error: "Capabilities require GET with an empty body." },
+                  status: request.method === "GET" ? 400 : 405,
+                },
+        });
       }
 
-      // Keep the richer Hunk session API here rather than in the shared package so commands like
-      // review, reload, and comment flows stay app-specific.
+      // Keep Hunk action parsing and lowering app-owned while the generic hook authenticates,
+      // authorizes, budgets, and signs the exact transport body and response.
       if (url.pathname === HUNK_SESSION_API_PATH) {
-        return handleSessionApiRequest(state, request);
+        return daemon.handleAuthenticatedControl(request, {
+          resolve: (body) => sessionApiAuthorizationFacts(state, body),
+          resolveFailureTargetSpecific: (body) => parseJsonRequestBytes(body).action !== "list",
+          handle: async (body, facts) => {
+            const response = await handleSessionApiRequest(state, request, body, facts.sessionId);
+            return { body: (await response.json()) as never, status: response.status };
+          },
+        });
+      }
+
+      // The review surface authorizes every one of its own routes with a per-session
+      // capability, so it is mounted after the daemon's host/origin checks and before the
+      // legacy tombstone; it declines anything that is not a review route.
+      const review = await browserReview.handle(request);
+      if (review) {
+        return review;
       }
 
       if (url.pathname === LEGACY_MCP_PATH) {
@@ -496,6 +713,7 @@ export function serveSessionBrokerDaemon(
   const shutdown = () => {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
+    browserReview.close();
     server.stop(true);
   };
 

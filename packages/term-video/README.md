@@ -16,7 +16,7 @@ inspectable PNG before anything is encoded.
 - `@hunk/term-video/plan` (Bun or Node) — pure storyboard→frame-plan
   expansion: `planFrames`, `requiredKeyframes`. Unit-tested; owns the caption
   carry-forward and animation-window semantics.
-- `@hunk/term-video/compose` (Node ≥ 18) — `composeStoryboard` renders the
+- `@hunk/term-video/compose` (Node ≥ 22) — `composeStoryboard` renders the
   plan in headless Chromium against `src/stage.html` (or a custom stage) and
   writes PNG frames plus an ffmpeg concat list. `playwright-core` is resolved
   from the caller's work directory so its version can match the driven
@@ -25,6 +25,6 @@ inspectable PNG before anything is encoded.
 ## Consumers
 
 `scripts/launch-video/` holds Hunk's current storyboard (scenes, captions,
-cards) on top of this package; `skills/launch-video/SKILL.md` documents the
+cards) on top of this package; `skills/hunk-launch-video/SKILL.md` documents the
 end-to-end workflow and recipes for single-feature, custom, and full-release
 videos, environment gotchas included.

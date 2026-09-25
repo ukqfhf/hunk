@@ -2,21 +2,12 @@ import {
   resolveSessionBrokerConfig,
   type ResolvedSessionBrokerConfig,
 } from "../broker/brokerConfig";
-import {
-  HUNK_SESSION_API_VERSION,
-  HUNK_SESSION_CAPABILITIES_PATH,
-  HUNK_SESSION_DAEMON_VERSION,
-  type SessionDaemonCapabilities,
-} from "../protocol";
+import { HUNK_SESSION_CAPABILITIES_PATH, type SessionDaemonCapabilities } from "../protocol";
+import { parseSessionDaemonCapabilities } from "../protocolSchemas";
 import { HUNK_SESSION_DAEMON_HTTP_TIMEOUT_MS, requestSessionDaemonHttp } from "./daemonHttp";
 
-export const HUNK_DAEMON_UPGRADE_RESTART_NOTICE =
-  "[hunk:session] Restarting stale session daemon after upgrade.";
-
-/** Tell the user that Hunk is refreshing an old daemon left running across an upgrade. */
-export function reportHunkDaemonUpgradeRestart(log: (message: string) => void = console.error) {
-  log(HUNK_DAEMON_UPGRADE_RESTART_NOTICE);
-}
+export const HUNK_DAEMON_UPGRADE_WAIT_MESSAGE =
+  "An older or incompatible Hunk session daemon is running. Close older Hunk windows; this window will reconnect automatically.";
 
 /**
  * Read the live daemon's advertised compatibility, returning null when the daemon is too old for
@@ -47,18 +38,7 @@ export async function readHunkSessionDaemonCapabilities(
         return null;
       }
 
-      if (
-        !capabilities ||
-        typeof capabilities !== "object" ||
-        (capabilities as { version?: unknown }).version !== HUNK_SESSION_API_VERSION ||
-        (capabilities as { daemonVersion?: unknown }).daemonVersion !==
-          HUNK_SESSION_DAEMON_VERSION ||
-        !Array.isArray((capabilities as { actions?: unknown }).actions)
-      ) {
-        return null;
-      }
-
-      return capabilities as SessionDaemonCapabilities;
+      return parseSessionDaemonCapabilities(capabilities);
     },
   });
 }

@@ -8,13 +8,14 @@ import {
   listArcUntrackedFiles,
   resolveArcRepoRoot,
   runArcText,
-} from "../../../../core/vcs/arc";
+} from "./commands";
 import {
-  HUNK_CORE_VCS_DETECTION_PRIORITY,
+  HUNK_VCS_DETECTION_BASELINE_PRIORITY,
   type ExtensionVcsAdapter,
   type ExtensionVcsDiffInput,
   type HunkExtensionAPI,
-} from "../../../../extension-api/types";
+} from "hunkdiff/extension";
+import { describeDiffRange } from "../diffRange";
 
 /** Return the last path segment for review titles. */
 function basename(path: string) {
@@ -60,16 +61,17 @@ export const ArcVcsAdapter = {
     return repoRoot ? { id: "arc" as const, repoRoot } : null;
   },
   // Prefer Arc when a local checkout also exposes Git-compatible metadata.
-  detectionPriority: HUNK_CORE_VCS_DETECTION_PRIORITY + 50,
+  detectionPriority: HUNK_VCS_DETECTION_BASELINE_PRIORITY + 50,
   operations: {
     "working-tree-diff": {
       async load(input, { cwd }) {
         const result = loadArcWorkingTree(input, cwd);
         const repoName = basename(result.repoRoot);
+        const range = describeDiffRange(input);
         const title = input.staged
           ? `${repoName} staged changes`
-          : input.range
-            ? `${repoName} ${input.range}`
+          : range
+            ? `${repoName} ${range}`
             : `${repoName} working tree`;
         return {
           ...result,

@@ -1,10 +1,10 @@
 import { parsePatchFiles } from "@pierre/diffs";
-import { patchLooksBinary } from "../core/binary";
-import { normalizeDiffMetadataPaths, normalizeDiffPath } from "../core/diffPaths";
-import { countDiffStats } from "../core/diffFile";
+import { patchLooksBinary } from "../core/changeset/binary";
+import { normalizeDiffMetadataPaths, normalizeDiffPath } from "../core/changeset/diffPaths";
+import { countDiffStats } from "../core/changeset/diffFile";
 import { splitPatchIntoFileChunks, findPatchChunk } from "../core/patch/chunks";
-import { normalizePatch } from "../core/patch/normalize";
-import type { DiffFile } from "../core/types";
+import { sanitizePatch } from "../core/patch/sanitize";
+import type { DiffFile } from "../core/changeset/model";
 import type { HunkDiffFile, HunkDiffFileInput } from "./types";
 
 const NORMALIZED_HUNK_DIFF_FILES = new WeakSet<HunkDiffFile>();
@@ -71,13 +71,13 @@ export function toInternalDiffFile(diff: HunkDiffFileInput): DiffFile {
 
 /** Parse unified diff text into Hunk's public OpenTUI file model. */
 export function createHunkDiffFilesFromPatch(patchText: string, sourceId = "patch") {
-  const normalizedPatch = normalizePatch(patchText);
-  const chunks = splitPatchIntoFileChunks(normalizedPatch.text);
+  const sanitizedPatch = sanitizePatch(patchText);
+  const chunks = splitPatchIntoFileChunks(sanitizedPatch.text);
 
-  return parsePatchFiles(normalizedPatch.text, sourceId, true)
+  return parsePatchFiles(sanitizedPatch.text, sourceId, true)
     .flatMap((entry) => entry.files)
     .map((metadata, index) => {
-      const decodedPaths = normalizedPatch.filePaths[index];
+      const decodedPaths = sanitizedPatch.filePaths[index];
       const normalizedMetadata = decodedPaths
         ? { ...metadata, name: decodedPaths.path, prevName: decodedPaths.previousPath }
         : metadata;

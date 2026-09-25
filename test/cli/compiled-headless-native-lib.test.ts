@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -19,37 +19,67 @@ const positiveControlExecutable = positiveControlBuildRoot
       process.platform === "win32" ? "opentui-control.exe" : "opentui-control",
     )
   : undefined;
+const highlightWorkerControlExecutable = positiveControlBuildRoot
+  ? resolve(
+      positiveControlBuildRoot,
+      process.platform === "win32" ? "highlight-worker-control.exe" : "highlight-worker-control",
+    )
+  : undefined;
 
 let rootsToClean: string[] = [];
 
-beforeAll(() => {
-  if (!positiveControlExecutable) {
+/** Builds the compiled controls that calibrate native-library assertions. */
+function buildCompiledControls() {
+  if (!positiveControlExecutable || !highlightWorkerControlExecutable) {
     return;
   }
 
-  const source = resolve(import.meta.dir, "fixtures", "compiled-opentui-positive-control.ts");
-  const build = Bun.spawnSync(
-    [
-      process.execPath,
-      "build",
-      "--compile",
-      "--no-compile-autoload-bunfig",
-      source,
-      "--outfile",
-      positiveControlExecutable,
-    ],
+  const controls = [
     {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
+      name: "OpenTUI positive control",
+      entries: [resolve(import.meta.dir, "fixtures", "compiled-opentui-positive-control.ts")],
+      executable: positiveControlExecutable,
+      root: undefined,
     },
-  );
-  if (build.exitCode !== 0) {
-    throw new Error(
-      `Failed to build the OpenTUI positive control: ${Buffer.from(build.stderr).toString("utf8")}`,
+    {
+      name: "highlight worker control",
+      entries: [
+        resolve(import.meta.dir, "fixtures", "compiled-highlight-worker-control.ts"),
+        resolve(import.meta.dir, "..", "..", "src", "highlightWorkerEntry.ts"),
+      ],
+      executable: highlightWorkerControlExecutable,
+      root: resolve(import.meta.dir, "..", "..", "src"),
+    },
+  ];
+
+  for (const control of controls) {
+    const build = Bun.spawnSync(
+      [
+        process.execPath,
+        "build",
+        "--compile",
+        "--no-compile-autoload-bunfig",
+        ...(control.root ? ["--root", control.root] : []),
+        ...control.entries,
+        "--outfile",
+        control.executable,
+      ],
+      {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
     );
+    if (build.exitCode !== 0) {
+      throw new Error(
+        `Failed to build the ${control.name}: ${Buffer.from(build.stderr).toString("utf8")}`,
+      );
+    }
   }
-});
+}
+
+// Two cold Bun compilations can exceed the default 5s hook deadline on hosted Windows runners.
+beforeAll(buildCompiledControls, { timeout: 15_000 });
 
 afterAll(() => {
   if (positiveControlBuildRoot) {
@@ -70,19 +100,23 @@ function createTestEnvironment(port?: number) {
   rootsToClean.push(root);
   const home = resolve(root, "home");
   const cache = resolve(root, "cache");
+  const config = resolve(root, "config");
   const runtime = resolve(root, "runtime");
   const temp = resolve(root, "tmp");
-  for (const dir of [home, cache, runtime, temp]) {
+  for (const dir of [home, cache, config, runtime, temp]) {
     mkdirSync(dir, { recursive: true });
   }
 
   return {
+    config,
+    home,
     temp,
     env: {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
       XDG_CACHE_HOME: cache,
+      XDG_CONFIG_HOME: config,
       XDG_RUNTIME_DIR: runtime,
       TMPDIR: temp,
       BUN_TMPDIR: temp,
@@ -148,6 +182,24 @@ describe("compiled headless native-library loading", () => {
     expect(nativeArtifacts(temp).length).toBeGreaterThan(0);
   });
 
+  compiledTest("starts its embedded highlight worker entrypoint", () => {
+    const { env } = createTestEnvironment();
+    const proc = Bun.spawnSync([highlightWorkerControlExecutable!], {
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(Buffer.from(proc.stderr).toString("utf8")).toBe("");
+    expect(proc.exitCode).toBe(0);
+    expect(Buffer.from(proc.stdout).toString("utf8")).toContain(
+      process.platform === "win32"
+        ? "compiled highlight worker disabled"
+        : "compiled highlight worker ready",
+    );
+  });
+
   compiledTest(
     "does not extract OpenTUI for short-lived headless commands",
     () => {
@@ -180,6 +232,53 @@ describe("compiled headless native-library loading", () => {
     },
     15_000,
   );
+
+  compiledTest("keeps a non-UI extension CLI command OpenTUI-free", () => {
+    const { env, temp } = createTestEnvironment();
+    const extensionPath = resolve(temp, "headless-cli.ts");
+    writeFileSync(
+      extensionPath,
+      `export default function (hunk) {
+  hunk.registerCliCommand({ name: "headless-probe", summary: "Probe" }, async (_args, ctx) => {
+    await ctx.stdout.write("ok\\n");
+    return { kind: "exit" };
+  });
+}\n`,
+    );
+
+    const proc = Bun.spawnSync([executable!, "--extension", extensionPath, "headless-probe"], {
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(proc.exitCode).toBe(0);
+    expect(Buffer.from(proc.stdout).toString("utf8")).toBe("ok\n");
+    expect(Buffer.from(proc.stderr).toString("utf8")).toBe("");
+    expect(nativeArtifacts(temp)).toEqual([]);
+  });
+
+  compiledTest("discovers the installed-shape GitHub extension for literal hunk gh", () => {
+    const { config, env, temp } = createTestEnvironment();
+    const installedPath = resolve(config, "hunk", "extensions", "github-pr");
+    mkdirSync(resolve(config, "hunk", "extensions"), { recursive: true });
+    cpSync(resolve(import.meta.dir, "../../examples/extensions/github-pr"), installedPath, {
+      recursive: true,
+    });
+
+    const proc = Bun.spawnSync([executable!, "gh", "--help"], {
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(proc.exitCode).toBe(0);
+    expect(Buffer.from(proc.stderr).toString("utf8")).toBe("");
+    expect(Buffer.from(proc.stdout).toString("utf8")).toContain("Usage: hunk gh");
+    expect(nativeArtifacts(temp)).toEqual([]);
+  });
 
   compiledLinuxTest("keeps captured-host static pager rendering OpenTUI-free", () => {
     const { env, temp } = createTestEnvironment();

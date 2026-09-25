@@ -25,11 +25,21 @@ import type {
   ExtensionChangeset,
   ExtensionCommandControls,
   ExtensionCommandExecutionOptions,
+  ExtensionFileLanguageMatcher,
   ExtensionFileViewRow,
   ExtensionFileViewRowComponentProps,
   ExtensionFileViewSourceRange,
+  ExtensionKeyboardModeControls,
+  ExtensionKeyboardModeKeyResult,
+  ExtensionLineHighlight,
+  ExtensionLineHighlightTone,
   ExtensionPaintTheme,
+  ExtensionHorizontalPane,
+  ExtensionPaneProps,
+  ExtensionPaneSize,
   ExtensionReviewSelection,
+  ExtensionSessionOptions,
+  ExtensionVerticalPane,
   ExtensionVcsAdapter,
   ExtensionVcsDiffInput,
   ExtensionVcsLoadContext,
@@ -40,8 +50,26 @@ import type {
 } from "hunkdiff/extension";
 
 export default function (hunk: HunkExtensionAPI) {
-  const noSelection: ExtensionReviewSelection = { file: null, hunkIndex: null };
+  const sessionOptions: ExtensionSessionOptions = { viewPreferences: "transient" };
+  hunk.configureSession(sessionOptions);
+  const noSelection: ExtensionReviewSelection = {
+    file: null,
+    hunkIndex: null,
+    currentLine: null,
+  };
   hunk.log(noSelection.file === null ? "nothing selected" : noSelection.file.path);
+  hunk.log(noSelection.currentLine?.side ?? "no current line");
+  hunk.registerCliCommand(
+    { name: "review-tools", summary: "Prepare or inspect a review", usage: "<action>" },
+    async (args, ctx) => {
+      if (args[0] === "review") {
+        await ctx.stderr.write("Preparing review…\\n");
+        return { kind: "delegate", argv: ["diff"] };
+      }
+      await ctx.stdout.write(new TextEncoder().encode(ctx.cwd + "\\n"));
+      return { kind: "exit", code: ctx.signal.aborted ? 1 : 0 };
+    },
+  );
 
   const theme: NamedCustomThemeConfig = {
     id: "midnight-review",
@@ -52,6 +80,47 @@ export default function (hunk: HunkExtensionAPI) {
   };
   hunk.registerTheme(theme);
   hunk.registerFileLanguage(".zig", "zig");
+  const generatedTypeScript: ExtensionFileLanguageMatcher = {
+    kind: "glob",
+    value: "generated/**/*.ts",
+    target: "path",
+  };
+  hunk.registerFileLanguage(generatedTypeScript, "typescript");
+
+  const pane = (props: ExtensionPaneProps) => {
+    hunk.log(\`\${props.placement}:\${props.width}x\${props.height}\`);
+    props.currentLine?.render("new", props.width);
+    hunk.log(props.currentLine ? props.currentLine.side + ":" + props.currentLine.line : "no line");
+    return null;
+  };
+  const paneSize: ExtensionPaneSize = { preferred: 3, min: 2, max: 4, fraction: 0.25 };
+  for (const placement of ["left", "right"] as const) {
+    const verticalPane: ExtensionVerticalPane = {
+      id: placement,
+      placement,
+      width: paneSize,
+      component: pane,
+    };
+    hunk.registerPane(verticalPane);
+  }
+  for (const placement of ["top", "bottom"] as const) {
+    const horizontalPane: ExtensionHorizontalPane = {
+      id: placement,
+      placement,
+      height: paneSize,
+      currentLine: placement === "bottom",
+      component: pane,
+    };
+    hunk.registerPane(horizontalPane);
+  }
+  hunk.registerSidebarView({
+    id: "legacy",
+    placement: "right",
+    component: ({ files, width }) => {
+      hunk.log(\`legacy:\${files.length}:\${width}\`);
+      return null;
+    },
+  });
 
   const renderRow = (props: ExtensionFileViewRowComponentProps) => {
     const paintTheme: ExtensionPaintTheme = props.theme;
@@ -99,8 +168,43 @@ export default function (hunk: HunkExtensionAPI) {
       };
     },
   });
+  const matchTone: ExtensionLineHighlightTone = "match";
+  hunk.registerLineHighlighter({
+    id: "needles",
+    async highlight(input) {
+      const document: string | null = await input.readDocument("old");
+      hunk.log(document === null ? input.file.path : "read old side");
+      const mark: ExtensionLineHighlight = {
+        side: "new",
+        line: 1,
+        range: [0, 4],
+        tone: matchTone,
+      };
+      const otherTones: ExtensionLineHighlightTone[] = [
+        "current",
+        "info",
+        "warning",
+        "error",
+        "dim",
+      ];
+      hunk.log(String(otherTones.length));
+      // @ts-expect-error Ranges are immutable tuples.
+      mark.range[0] = 2;
+      return [mark];
+    },
+  });
+  hunk.registerKeyboardMode({
+    id: "review-keys",
+    title: "Review keys",
+    onKey(key, ctx): ExtensionKeyboardModeKeyResult {
+      if (key.name !== "j") return "pass";
+      ctx.commands.execute("hunk.review.stepDown");
+      return "handled";
+    },
+  });
   hunk.registerCommand({ id: "raw-view", title: "Raw view" }, (ctx) => {
     const commandControls: ExtensionCommandControls = ctx.commands;
+    const modeControls: ExtensionKeyboardModeControls = ctx.keyboardModes;
     const execution: ExtensionCommandExecutionOptions = { count: 2 };
     if (commandControls.isEnabled("hunk.review.nextHunk")) {
       const executed: boolean = commandControls.execute("hunk.review.nextHunk", execution);
@@ -116,6 +220,24 @@ export default function (hunk: HunkExtensionAPI) {
       hunk.log(entered ? "mode running" : "mode refused");
     }
     ctx.fileViews.exitMode();
+    ctx.highlights.refresh("needles");
+    ctx.highlights.refresh("needles", { fileId: ctx.selection.file?.id ?? "" });
+    if (!modeControls.isActive("review-keys")) {
+      modeControls.enterMode("review-keys");
+    }
+    modeControls.exitMode();
+    ctx.panes.toggle("bottom");
+    if (ctx.sidebars.isOpen("legacy")) ctx.sidebars.close("legacy");
+
+    const targetFile = ctx.selection.file;
+    if (targetFile) {
+      ctx.navigation.selectFile(targetFile.id);
+      ctx.navigation.selectHunk(targetFile.id, 0);
+      ctx.navigation.revealLine(targetFile.id, "new", 211);
+      ctx.navigation.revealLine(targetFile.id, "old", 1);
+      // @ts-expect-error Only the two diff sides address a line.
+      ctx.navigation.revealLine(targetFile.id, "both", 1);
+    }
   });
 
   hunk.registerCommand({ id: "rewrite", title: "Rewrite the selection" }, async (ctx) => {
@@ -161,7 +283,12 @@ export default function (hunk: HunkExtensionAPI) {
             title: "Mercurial working copy",
             patchText: "",
             untrackedPaths: [],
-            readFileSource: async ({ path, side }) => (side === "old" ? null : path),
+            readFileSource: async ({ path, side }) =>
+              side === "old"
+                ? null
+                : path.endsWith(".generated")
+                  ? { kind: "too-large", maxBytes: 1_000_000 }
+                  : path,
             extraFiles: [
               { kind: "patch", path: "notes.md", patchText: "", isUntracked: true },
               {
@@ -196,14 +323,26 @@ export default function (hunk: HunkExtensionAPI) {
     files: changeset.files.filter((file) => !file.path.endsWith(".lock")),
   }));
 
-  hunk.on("startup", (event, ctx) => {
+  hunk.on("startup", async (event, ctx) => {
     ctx.notify(\`started in \${event.cwd}\`, "info");
+    if (await ctx.dialogs.confirm({ title: "Reveal the first line?" })) {
+      ctx.navigation.revealLine("file-id", "new", 1);
+    }
+  });
+  hunk.on("command_executed", ({ commandId }) => {
+    hunk.log(\`terminal command \${commandId}\`);
   });
   hunk.on("changeset_loaded", (event) => {
     hunk.log(\`loaded \${event.changeset.files.length} files\`);
   });
   hunk.on("selection_changed", (event) => {
     hunk.log(\`selected \${event.fileId ?? "nothing"} #\${event.hunkIndex ?? -1}\`);
+  });
+  hunk.on("hunk_viewed", (event) => {
+    hunk.log(\`viewed hunk \${event.hunkIndex} in \${event.file.path}\`);
+  });
+  hunk.on("note_changed", (event) => {
+    hunk.log(\`note \${event.kind} \${event.note.id}\`);
   });
   hunk.on("session_reload", (event) => {
     hunk.log(\`reloaded because \${event.reason}\`);
@@ -285,8 +424,9 @@ const forbiddenPrefixes = [
   "tmp/",
   "dist/npm/core/",
   "dist/npm/ui/",
-  // Maintainer-only release engineering; it references scripts/ which never ships.
-  "skills/launch-video/",
+  // Maintainer-only workflows reference repository scripts and never ship.
+  "skills/hunk-launch-video/",
+  "skills/hunk-release/",
 ];
 const forbiddenPaths = ["AGENTS.md", "bun.lock"];
 

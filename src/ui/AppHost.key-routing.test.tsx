@@ -5,7 +5,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { ScrollBoxRenderable, type Renderable } from "@opentui/core";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
-import type { AppBootstrap } from "../core/types";
+import type { AppBootstrap } from "../core/bootstrap";
 import { createTestVcsAppBootstrap } from "../../test/helpers/app-bootstrap";
 import { createTestDiffFile } from "../../test/helpers/diff-helpers";
 import { loadStartupExtensions } from "../extensions/startup";
@@ -162,7 +162,7 @@ describe("UI key routing with a focused scroll box", () => {
     }
   });
 
-  test("the theme selector swallows unhandled keys instead of letting them scroll the stream", async () => {
+  test("the theme selector owns vertical review keys instead of scrolling the stream", async () => {
     const { setup, scrollBox } = await setupWithFocusedScrollBox();
 
     try {
@@ -178,15 +178,16 @@ describe("UI key routing with a focused scroll box", () => {
       );
       expect(selectorFrame).toContain("Theme selector");
 
-      // "j" is not a selector key, and it must not reach the scroll box
-      // either: a modal surface owns every key it does not explicitly handle.
+      // The review's down key moves the selector and must not reach the focused scroll box.
       await act(async () => {
         await setup.mockInput.typeText("j");
       });
       await flush(setup);
 
       expect(scrollBox.scrollTop).toBe(scrollTopBefore);
-      expect(setup.captureCharFrame()).toContain("Theme selector");
+      const movedFrame = setup.captureCharFrame();
+      expect(movedFrame).toContain("Theme selector");
+      expect(movedFrame).toContain("›  github-dark-dimmed");
     } finally {
       await act(async () => {
         setup.renderer.destroy();
@@ -270,6 +271,70 @@ describe("UI key routing with a focused scroll box", () => {
       await act(async () => setup.mockInput.typeText("j"));
       await flush(setup);
       expect(scrollBox.scrollTop).toBeGreaterThan(scrollTopBefore);
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an extension pane editor receives typing before app and extension commands", async () => {
+    const root = mkdtempSync(join(tmpdir(), "hunk-key-routing-pane-input-"));
+    const extension = join(root, "prompt-pane");
+    mkdirSync(extension, { recursive: true });
+    writeFileSync(
+      join(extension, "package.json"),
+      JSON.stringify({
+        name: "prompt-pane",
+        private: true,
+        hunk: { extensions: ["./index.tsx"] },
+      }),
+    );
+    writeFileSync(
+      join(extension, "index.tsx"),
+      `import { createElement, useState } from "react";
+export default function (hunk) {
+  hunk.registerPane({
+    id: "prompt",
+    placement: "bottom",
+    defaultOpen: true,
+    height: { preferred: 3, min: 3, max: 3 },
+    component: () => {
+      const [value, setValue] = useState("");
+      return createElement("input", { value, focused: true, onInput: setValue });
+    },
+  });
+  hunk.registerCommand({ id: "letter", title: "Letter command", key: "j" }, (ctx) => {
+    ctx.notify("COMMAND FIRED");
+  });
+}
+`,
+    );
+    const extensions = await loadStartupExtensions({
+      cliExtensionPaths: [extension],
+      cwd: root,
+      env: { XDG_CONFIG_HOME: root } as NodeJS.ProcessEnv,
+      extensions: { enabled: true, extensionConfigs: {}, paths: [], repoPaths: [] },
+    });
+    const bootstrap = createScrollableBootstrap();
+    bootstrap.extensions = extensions;
+    const setup = await testRender(<AppHost bootstrap={bootstrap} onQuit={() => {}} />, {
+      width: 120,
+      height: 24,
+    });
+
+    try {
+      await waitForFrame(setup, () => setup.renderer.currentFocusedEditor !== null, 12);
+      expect(setup.renderer.currentFocusedEditor).not.toBeNull();
+
+      await act(async () => setup.mockInput.typeText("j?"));
+      await flush(setup);
+
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("j?");
+      expect(frame).not.toContain("COMMAND FIRED");
+      expect(frame).not.toContain("Controls help");
     } finally {
       await act(async () => {
         setup.renderer.destroy();

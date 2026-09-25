@@ -8,6 +8,8 @@ import type { Key, Session } from "tuistory";
 const integrationDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(integrationDir, "../..");
 const sourceEntrypoint = join(repoRoot, "src/main.tsx");
+// Hunk renders atomically and tests wait on concrete UI predicates, so the safer 200ms default is unnecessary.
+const tuistoryIdleDelayMs = 60;
 
 function resolveBunExecutable() {
   const envCandidate = process.env.BUN_BIN ?? process.env.BUN;
@@ -336,6 +338,51 @@ export function createPtyHarness() {
     return { dir, before, after, agentContext };
   }
 
+  /**
+   * Two hunks with a collapsed gap between them, annotated on a line inside that gap.
+   *
+   * The annotated lines are unchanged context the patch omits, so no rendered row carries
+   * them: the note has to hang from the hunk owning the gap rather than from the file's
+   * first row.
+   */
+  function createGapAnnotatedAgentFilePair() {
+    const dir = makeTempDir("hunk-tuistory-gap-note-");
+    const before = join(dir, "before.ts");
+    const after = join(dir, "after.ts");
+    const agentContext = join(dir, "agent.json");
+
+    const beforeLines = Array.from(
+      { length: 12 },
+      (_, index) => `export const line${index + 1} = ${index + 1};`,
+    );
+    const afterLines = [...beforeLines];
+    afterLines[1] = "export const line2 = 200;";
+    afterLines[10] = "export const line11 = 1100;";
+
+    writeText(before, `${beforeLines.join("\n")}\n`);
+    writeText(after, `${afterLines.join("\n")}\n`);
+    writeText(
+      agentContext,
+      JSON.stringify({
+        version: 1,
+        files: [
+          {
+            path: "after.ts",
+            annotations: [
+              {
+                newRange: [6, 7],
+                summary: "GAP NOTE",
+                rationale: "Anchored to lines the patch collapsed away.",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    return { dir, before, after, agentContext };
+  }
+
   function createAgentNavigationRepoFixture() {
     const alphaBeforeLines = createNumberedExportLines(1, 80).split("\n");
     const alphaAfterLines = [...alphaBeforeLines];
@@ -516,20 +563,37 @@ export function createPtyHarness() {
    * test shows only the two changed source files, keeping snapshot assertions
    * about the extension's effect unambiguous.
    */
-  function createRepoExtensionFixture(source: string, entryName = "fixture.ts") {
+  function createRepoExtensionFixture(
+    source: string,
+    entryName = "fixture.ts",
+    changedFiles: ChangedFileSpec[] = [
+      {
+        path: "alpha.ts",
+        before: "export const alpha = 1;\n",
+        after: "export const alphaValue = 2;\n",
+      },
+      {
+        path: "beta.ts",
+        before: "export const beta = 1;\n",
+        after: "export const betaValue = 2;\n",
+      },
+    ],
+  ) {
     const dir = makeTempDir("hunk-tuistory-extension-");
 
     runGit(["init"], dir);
     runGit(["config", "user.name", "Pi"], dir);
     runGit(["config", "user.email", "pi@example.com"], dir);
-    writeText(join(dir, "alpha.ts"), "export const alpha = 1;\n");
-    writeText(join(dir, "beta.ts"), "export const beta = 1;\n");
+    for (const file of changedFiles) {
+      writeText(join(dir, file.path), file.before);
+    }
     writeText(join(dir, ".hunk", "extensions", entryName), source);
     runGit(["add", "."], dir);
     runGit(["commit", "-m", "initial"], dir);
 
-    writeText(join(dir, "alpha.ts"), "export const alphaValue = 2;\n");
-    writeText(join(dir, "beta.ts"), "export const betaValue = 2;\n");
+    for (const file of changedFiles) {
+      writeText(join(dir, file.path), file.after);
+    }
 
     return { dir };
   }
@@ -553,6 +617,44 @@ export function createPtyHarness() {
     }
 
     return { dir };
+  }
+
+  /**
+   * Build a block that moves between two files, with Git's move detection enabled.
+   *
+   * `plainAddition` is an ordinary added line in the same diff, so tests can tell a moved tint
+   * from the added tint instead of only asserting that some tint was painted.
+   */
+  function createMovedLinesRepoFixture() {
+    const movedBlock = [
+      "MOVED BLOCK ALPHA",
+      "MOVED BLOCK BRAVO",
+      "MOVED BLOCK CHARLIE",
+      "MOVED BLOCK DELTA",
+    ];
+    const plainAddition = "brand new destination line";
+    const fixture = createGitRepoFixture([
+      {
+        path: "source.txt",
+        before: ["source header one", "source header two", ...movedBlock, "source footer"].join(
+          "\n",
+        ),
+        after: ["source header one", "source header two", "source footer"].join("\n"),
+      },
+      {
+        path: "destination.txt",
+        before: ["destination header one", "destination header two"].join("\n"),
+        after: [
+          "destination header one",
+          "destination header two",
+          ...movedBlock,
+          plainAddition,
+        ].join("\n"),
+      },
+    ]);
+
+    runGit(["config", "diff.colorMoved", "zebra"], fixture.dir);
+    return { ...fixture, movedBlock, plainAddition };
   }
 
   /** Build the long-path fixture used to verify narrow file-header layout. */
@@ -626,6 +728,33 @@ end
     ]);
   }
 
+  /** Build nested changed files whose sidebar labels distinguish flat and tree projections. */
+  function createNestedSidebarRepoFixture() {
+    return createGitRepoFixture([
+      {
+        path: "src/ui/alpha.ts",
+        before: "export const alpha = 1;\n",
+        after: "export const alpha = 2;\nexport const add = true;\n",
+      },
+      {
+        path: "src/ui/beta.ts",
+        before: "export const beta = 1;\n",
+        after: "export const betaValue = 1;\n",
+      },
+    ]);
+  }
+
+  /** Build many short files so a tall first paint must mount past the first-file overscan neighbor. */
+  function createManyShortFileRepoFixture() {
+    return createGitRepoFixture(
+      Array.from({ length: 8 }, (_, index) => ({
+        path: `short-${index}.ts`,
+        before: `export const short${index} = ${index};\n`,
+        after: `export const short${index} = ${index + 10};\n`,
+      })),
+    );
+  }
+
   function createPinnedHeaderRepoFixture() {
     return createGitRepoFixture([
       {
@@ -639,6 +768,17 @@ end
         after: `${createNumberedExportLines(17, 16, 100)}\n`,
       },
     ]);
+  }
+
+  /** Build enough syntax-highlighted changes to exercise rapid whole-review theme previews. */
+  function createRapidThemePreviewTestRepoFixture() {
+    return createGitRepoFixture(
+      Array.from({ length: 8 }, (_, fileIndex) => ({
+        path: `theme-preview-${fileIndex}.ts`,
+        before: `${createNumberedExportLines(1, 150, fileIndex * 1_000)}\n`,
+        after: `${createNumberedExportLines(1, 150, (fileIndex + 8) * 1_000)}\n`,
+      })),
+    );
   }
 
   function createCollapsedTopRepoFixture() {
@@ -844,6 +984,7 @@ end
 
     return launchTerminal({
       command: explicitHunkExecutable ?? bunExecutable,
+      idleDelayMs: tuistoryIdleDelayMs,
       args: explicitHunkExecutable
         ? options.args
         : ["run", sourceEntrypoint, "--", ...options.args],
@@ -872,6 +1013,7 @@ end
 
     return launchTerminal({
       command: "/bin/bash",
+      idleDelayMs: tuistoryIdleDelayMs,
       args: ["-c", options.command],
       cwd: options.cwd ?? repoRoot,
       cols: options.cols ?? 140,
@@ -966,6 +1108,7 @@ end
     countMatches,
     createAgentFilePair,
     createAgentNavigationRepoFixture,
+    createGapAnnotatedAgentFilePair,
     createBottomClampedRepoFixture,
     createCollapsedTopRepoFixture,
     createExpandableContextFilePair,
@@ -976,11 +1119,15 @@ end
     createRepoExtensionFixture,
     createLinkedWorktreeWatchFixture,
     createLongWrapFilePair,
+    createMovedLinesRepoFixture,
     createMultiFilePagerPatchFixture,
+    createNestedSidebarRepoFixture,
     createMultiHunkFilePair,
     createNarrowHeaderTestRepoFixture,
     createPagerPatchFixture,
+    createManyShortFileRepoFixture,
     createPinnedHeaderRepoFixture,
+    createRapidThemePreviewTestRepoFixture,
     createScrollableFilePair,
     createSidebarJumpRepoFixture,
     createTabbedFilePair,

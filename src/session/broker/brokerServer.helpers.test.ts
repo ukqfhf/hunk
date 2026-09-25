@@ -78,8 +78,8 @@ describe("parseHostAndPort", () => {
     expect(parseHostAndPort("[::1]:0")).toBeNull();
   });
 
-  test("tolerates an unbracketed IPv6 literal by dropping the port", () => {
-    expect(parseHostAndPort("::1")).toEqual({ host: "::1", port: undefined });
+  test("rejects ambiguous unbracketed IPv6 authorities", () => {
+    expect(parseHostAndPort("::1")).toBeNull();
   });
 });
 
@@ -171,7 +171,9 @@ describe("handleSessionApiRequest", () => {
       listSessions: record("listSessions", [createTestListedSession({ sessionId: "s-1" })]),
       getSession: record("getSession", createTestListedSession({ sessionId: "s-1" })),
       getSelectedContext: record("getSelectedContext", { sessionId: "s-1" }),
-      getSessionReview: record("getSessionReview", { title: "review" }),
+      getSessionReviewWithResources: record("getSessionReviewWithResources", {
+        title: "review",
+      }),
       listComments: record("listComments", []),
       dispatchCommand: record("dispatchCommand", { ok: true }),
       ...overrides,
@@ -210,6 +212,37 @@ describe("handleSessionApiRequest", () => {
     expect(response.status).toBe(400);
   });
 
+  test("rejects malformed nested HTTP daemon request bodies before state dispatch", async () => {
+    const { state, calls } = createFakeState();
+    const malformed = [
+      { action: "get", selector: { sessionId: "s-1", extra: true } },
+      {
+        action: "reload",
+        selector: { sessionId: "s-1" },
+        nextInput: { kind: "vcs", staged: false, options: { tabWidth: 0 } },
+      },
+      {
+        action: "comment-apply",
+        selector: { sessionId: "s-1" },
+        comments: [{ filePath: "a.ts", summary: "note", hunkNumber: 0 }],
+        revealMode: "first",
+      },
+    ];
+
+    for (const body of malformed) {
+      const response = await handleSessionApiRequest(
+        state,
+        new Request(`http://127.0.0.1:${PORT}/session-api`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+      expect(response.status).toBe(400);
+    }
+    expect(calls).toEqual([]);
+  });
+
   test("routes list/get/context/review to the matching state methods", async () => {
     const { state, calls } = createFakeState();
     for (const action of ["list", "get", "context", "review"] as const) {
@@ -224,7 +257,7 @@ describe("handleSessionApiRequest", () => {
       "listSessions",
       "getSession",
       "getSelectedContext",
-      "getSessionReview",
+      "getSessionReviewWithResources",
     ]);
   });
 
@@ -254,6 +287,102 @@ describe("handleSessionApiRequest", () => {
     // hunkNumber is 1-based on the wire and converted to a 0-based hunkIndex.
     const dispatchInput = (dispatch!.args[0] as { input: { hunkIndex: number } }).input;
     expect(dispatchInput.hunkIndex).toBe(1);
+  });
+
+  test("prefers exact line coordinates over a co-supplied hunk number", async () => {
+    const { state, calls } = createFakeState();
+    const response = await handleSessionApiRequest(
+      state,
+      apiRequest({
+        action: "navigate",
+        selector: { sessionId: "s-1" },
+        filePath: "src/example.ts",
+        hunkNumber: 3,
+        side: "new",
+        line: 17,
+      } as SessionDaemonRequest),
+    );
+
+    expect(response.status).toBe(200);
+    const dispatch = calls.find((call) => call.method === "dispatchCommand");
+    expect(dispatch).toBeDefined();
+    expect((dispatch!.args[0] as { input: unknown }).input).toEqual({
+      sessionId: "s-1",
+      filePath: "src/example.ts",
+      hunkIndex: undefined,
+      side: "new",
+      line: 17,
+      commentDirection: undefined,
+    });
+  });
+
+  test("resolves a comment id before dispatching a navigate command", async () => {
+    const { state, calls } = createFakeState({
+      listComments: () => [
+        {
+          commentId: "comment-1",
+          filePath: "src/example.ts",
+          hunkIndex: 2,
+          side: "old",
+          line: 17,
+          summary: "Inspect this line",
+          createdAt: "2026-08-25T00:00:00.000Z",
+        },
+      ],
+    });
+    const response = await handleSessionApiRequest(
+      state,
+      apiRequest({
+        action: "navigate",
+        selector: { sessionId: "s-1" },
+        commentId: "comment-1",
+      } as SessionDaemonRequest),
+    );
+
+    expect(response.status).toBe(200);
+    const dispatch = calls.find((call) => call.method === "dispatchCommand");
+    expect(dispatch).toBeDefined();
+    expect((dispatch!.args[0] as { input: unknown }).input).toEqual({
+      sessionId: "s-1",
+      filePath: "src/example.ts",
+      side: "old",
+      line: 17,
+    });
+  });
+
+  test("rejects navigation to an unknown comment id", async () => {
+    const { state } = createFakeState();
+    const response = await handleSessionApiRequest(
+      state,
+      apiRequest({
+        action: "navigate",
+        selector: { sessionId: "s-1" },
+        commentId: "missing-comment",
+      } as SessionDaemonRequest),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining("missing-comment"),
+    });
+  });
+
+  test("rejects a comment id combined with another navigation target", async () => {
+    const { state } = createFakeState();
+    const response = await handleSessionApiRequest(
+      state,
+      apiRequest({
+        action: "navigate",
+        selector: { sessionId: "s-1" },
+        commentId: "comment-1",
+        hunkNumber: 2,
+      } as SessionDaemonRequest),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining("cannot be combined"),
+    });
   });
 
   test("dispatches reload, comment-add, comment-rm, and comment-clear commands", async () => {

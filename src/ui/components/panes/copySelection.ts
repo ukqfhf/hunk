@@ -1,19 +1,21 @@
-import type { DiffFile, LayoutMode } from "../../../core/types";
+import type { DiffFile } from "../../../core/changeset/model";
+import type { LayoutMode } from "../../../core/run/commandInputs";
+import { resolveSplitPaneWidths } from "../../diff/codeColumns";
+import { planCodeRowLayout } from "../../diff/codeRowLayout";
 import {
-  DIFF_RAIL_PREFIX_WIDTH,
-  resolveSplitCellGeometry,
-  resolveSplitPaneWidths,
-  resolveStackCellGeometry,
-} from "../../diff/codeColumns";
-import { renderCodeOnlyPlannedRowText, renderDecoratedPlannedRowText } from "../../diff/renderRows";
+  renderCodeOnlyPlannedRowText,
+  renderDecoratedPlannedRowText,
+} from "../../diff/plannedRowText";
 import {
   type DiffSectionGeometry,
   type DiffSectionRowBounds,
 } from "../../diff/diffSectionGeometry";
+import type { CopySelectedRowRange } from "../../lib/diffSpatial";
 import type { FileSectionLayout } from "../../lib/fileSectionLayout";
 import { fileHeaderStats, fitFileHeaderLabel } from "../../lib/fileHeader";
 import { cellRangeToCharRange, measureTextWidth, sliceTextByWidth } from "../../lib/text";
-import type { AppTheme } from "../../themes";
+import type { LineCursor } from "../../lib/lineCursors";
+import { contextLineStableKeySides, type PlannedReviewRow } from "../../diff/reviewRenderPlan";
 
 export type CopySelectionPoint =
   | {
@@ -36,6 +38,8 @@ export interface CopySelectionDrag {
   anchor: CopySelectionPoint;
   focus: CopySelectionPoint;
   moved: boolean;
+  /** Double/triple-click expansion always copies, even when its range is within click slop. */
+  expanded?: boolean;
 }
 
 export interface CopySelectionContext {
@@ -47,10 +51,10 @@ export interface CopySelectionContext {
   headerStatsWidth: number;
   layout: Exclude<LayoutMode, "auto">;
   pinnedHeaderFile?: DiffFile | null;
+  reserveAddNoteColumn: boolean;
   sectionGeometry: DiffSectionGeometry[];
   showHunkHeaders: boolean;
   showLineNumbers: boolean;
-  theme: AppTheme;
   width: number;
   wrapLines: boolean;
 }
@@ -90,6 +94,94 @@ function copySelectionBodyRange(start: CopySelectionPoint, end: CopySelectionPoi
   const endRow = end.kind === "pinned-header" ? end.nextVisualRow - 1 : end.visualRow;
 
   return { startRow, endRow };
+}
+
+/** Resolve the keyboard line cursor addressed by one un-dragged review-row click. */
+export function findLineCursorForClick({
+  cursors,
+  fileSectionLayouts,
+  point,
+  sectionGeometry,
+  side,
+}: {
+  cursors: LineCursor[];
+  fileSectionLayouts: FileSectionLayout[];
+  point: CopySelectionPoint;
+  sectionGeometry: DiffSectionGeometry[];
+  side?: CopySelectionSide;
+}) {
+  if (point.kind !== "review-row") {
+    return null;
+  }
+
+  for (const section of fileSectionLayouts) {
+    if (point.visualRow < section.bodyTop || point.visualRow >= section.sectionBottom) {
+      continue;
+    }
+
+    const geometry = sectionGeometry[section.sectionIndex];
+    if (!geometry) {
+      return null;
+    }
+
+    const bodyRow = point.visualRow - section.bodyTop;
+    const bounds = geometry.rowBounds.find((candidate) =>
+      rowBoundsContainsVisualRow(candidate, bodyRow),
+    );
+    if (!bounds) {
+      return null;
+    }
+
+    const stableKeys = new Set([bounds.stableKey, ...bounds.stableKeys]);
+    const rowCursors = cursors.filter(
+      (cursor) => cursor.fileId === section.fileId && stableKeys.has(cursor.stableKey),
+    );
+    if (side === undefined) {
+      return rowCursors[0] ?? null;
+    }
+
+    const targetSide = side === "left" ? "old" : "new";
+    return (
+      rowCursors.find((cursor) => cursor.target.side === targetSide) ??
+      (contextLineStableKeySides(bounds.stableKey) ? (rowCursors[0] ?? null) : null)
+    );
+  }
+
+  return null;
+}
+
+const COPY_SELECTION_CLICK_SLOP_CELLS = 1;
+
+/** Treat one-cell pointer jitter as a click while preserving deliberate and expanded drags. */
+export function copySelectionDragIsClick(drag: CopySelectionDrag) {
+  if (drag.expanded) {
+    return false;
+  }
+  if (!drag.moved) {
+    return true;
+  }
+  if (drag.anchor.kind !== drag.focus.kind) {
+    return false;
+  }
+
+  const columnDelta = Math.abs(drag.anchor.column - drag.focus.column);
+  if (columnDelta > COPY_SELECTION_CLICK_SLOP_CELLS) {
+    return false;
+  }
+
+  if (drag.anchor.kind === "pinned-header" && drag.focus.kind === "pinned-header") {
+    return (
+      drag.anchor.fileId === drag.focus.fileId &&
+      Math.abs(drag.anchor.nextVisualRow - drag.focus.nextVisualRow) <=
+        COPY_SELECTION_CLICK_SLOP_CELLS
+    );
+  }
+
+  return (
+    drag.anchor.kind === "review-row" &&
+    drag.focus.kind === "review-row" &&
+    Math.abs(drag.anchor.visualRow - drag.focus.visualRow) <= COPY_SELECTION_CLICK_SLOP_CELLS
+  );
 }
 
 /** Return whether two points represent the same selectable terminal cell. */
@@ -143,6 +235,77 @@ function trimCopiedLine(line: string) {
 function sliceLineByCells(line: string, startCell: number, endCell: number) {
   const { startIndex, endIndex } = cellRangeToCharRange(line, startCell, endCell);
   return line.slice(startIndex, endIndex);
+}
+
+interface CopyVisualLine {
+  visualRow: number;
+  text: string;
+  /** Global terminal column where the locally rendered text starts. */
+  globalColumnOffset: number;
+  /** Decorated output preserves blank visual lines; code-only output omits them. */
+  retainEmpty: boolean;
+}
+
+/** Clip one rendered visual line to the selected terminal cells. */
+function clipSelectedVisualLine(
+  line: CopyVisualLine,
+  start: CopySelectionPoint,
+  end: CopySelectionPoint,
+) {
+  const startRow = copySelectionSortRow(start);
+  const endRow = copySelectionSortRow(end);
+  if (line.visualRow < startRow || line.visualRow > endRow) {
+    return null;
+  }
+
+  const startColumn =
+    line.visualRow === startRow ? Math.max(0, start.column - line.globalColumnOffset) : 0;
+  const endColumn =
+    line.visualRow === endRow
+      ? Math.max(0, end.column - line.globalColumnOffset)
+      : Number.MAX_SAFE_INTEGER;
+  const copiedLine = trimCopiedLine(sliceLineByCells(line.text, startColumn, endColumn));
+
+  return copiedLine || line.retainEmpty ? copiedLine : null;
+}
+
+/** Resolve the global terminal origin for locally rendered planned-row text. */
+function resolveCopyVisualLineOffset({
+  context,
+  copySide,
+  lineNumberDigits,
+  row,
+}: {
+  context: CopySelectionContext;
+  copySide?: CopySelectionSide;
+  lineNumberDigits: number;
+  row: PlannedReviewRow;
+}) {
+  const { copyDecorations, layout, width } = context;
+  const splitPaneWidths = layout === "split" ? resolveSplitPaneWidths(width) : null;
+
+  if (copyDecorations) {
+    return copySide === "right" && splitPaneWidths ? splitPaneWidths.leftWidth : 0;
+  }
+
+  const codeLayout = planCodeRowLayout(row, {
+    lineNumberDigits,
+    reserveAddNoteColumn: context.reserveAddNoteColumn,
+    showLineNumbers: context.showLineNumbers,
+    width,
+    wrapLines: context.wrapLines,
+  });
+  if (codeLayout?.kind === "stack") {
+    return codeLayout.cell.prefixWidth + codeLayout.cell.gutterWidth;
+  }
+  if (codeLayout?.kind !== "split" || !copySide) {
+    return 0;
+  }
+
+  const cell = copySide === "right" ? codeLayout.right : codeLayout.left;
+  return (
+    (copySide === "right" ? codeLayout.leftPaneWidth : 0) + cell.prefixWidth + cell.gutterWidth
+  );
 }
 
 /** Return whether a character should be part of a double-click word selection. */
@@ -254,13 +417,19 @@ export function renderCopySelectionText({
     headerLabelWidth,
     headerStatsWidth,
     pinnedHeaderFile,
+    reserveAddNoteColumn,
     sectionGeometry,
     showHunkHeaders,
     showLineNumbers,
-    theme,
     width,
     wrapLines,
   } = context;
+
+  const copySide =
+    side ??
+    (context.layout === "split" && start.kind === "review-row"
+      ? resolveCopySelectionSide(start.column, context.layout, context.width)
+      : undefined);
 
   if (
     copyDecorations &&
@@ -268,17 +437,25 @@ export function renderCopySelectionText({
     start.kind === "pinned-header" &&
     start.fileId === pinnedHeaderFile.id
   ) {
-    const line = renderFileHeaderCopyText({
-      file: pinnedHeaderFile,
-      headerLabelWidth,
-      headerStatsWidth,
-      width,
-    });
-    const endColumn =
+    const pinnedHeaderLine: CopyVisualLine = {
+      visualRow: copySelectionSortRow(start),
+      text: renderFileHeaderCopyText({
+        file: pinnedHeaderFile,
+        headerLabelWidth,
+        headerStatsWidth,
+        width,
+      }),
+      globalColumnOffset: 0,
+      retainEmpty: true,
+    };
+    const pinnedHeaderEnd =
       end.kind === "pinned-header" && end.fileId === start.fileId
-        ? end.column
-        : Number.MAX_SAFE_INTEGER;
-    lines.push(trimCopiedLine(sliceLineByCells(line, start.column, endColumn)));
+        ? end
+        : { ...end, column: Number.MAX_SAFE_INTEGER };
+    const copiedLine = clipSelectedVisualLine(pinnedHeaderLine, start, pinnedHeaderEnd);
+    if (copiedLine !== null) {
+      lines.push(copiedLine);
+    }
   }
 
   const { startRow, endRow } = copySelectionBodyRange(start, end);
@@ -302,13 +479,19 @@ export function renderCopySelectionText({
           headerStatsWidth,
           width,
         });
-        const startColumn =
-          start.kind === "review-row" && section.headerTop === start.visualRow ? start.column : 0;
-        const endColumn =
-          end.kind === "review-row" && section.headerTop === end.visualRow
-            ? end.column
-            : Number.MAX_SAFE_INTEGER;
-        lines.push(trimCopiedLine(sliceLineByCells(line, startColumn, endColumn)));
+        const copiedLine = clipSelectedVisualLine(
+          {
+            visualRow: section.headerTop,
+            text: line,
+            globalColumnOffset: 0,
+            retainEmpty: true,
+          },
+          start,
+          end,
+        );
+        if (copiedLine !== null) {
+          lines.push(copiedLine);
+        }
       }
     }
 
@@ -317,11 +500,6 @@ export function renderCopySelectionText({
       continue;
     }
 
-    const copySide =
-      side ??
-      (context.layout === "split" && start.kind === "review-row"
-        ? resolveCopySelectionSide(start.column, context.layout, context.width)
-        : undefined);
     const plannedRows = geometry.plannedRows;
 
     for (let rowIndex = 0; rowIndex < geometry.rowBounds.length; rowIndex += 1) {
@@ -337,104 +515,46 @@ export function renderCopySelectionText({
         continue;
       }
 
-      const renderRowText = copyDecorations
-        ? renderDecoratedPlannedRowText
-        : renderCodeOnlyPlannedRowText;
-      const renderedLines = renderRowText(row, {
+      const rowTextOptions = {
         codeHorizontalOffset,
         lineNumberDigits: geometry.lineNumberDigits,
+        reserveAddNoteColumn,
         showHunkHeaders,
         showLineNumbers,
         side: copySide,
-        theme,
         width,
         wrapLines,
+      };
+      const renderRowText = copyDecorations
+        ? renderDecoratedPlannedRowText
+        : renderCodeOnlyPlannedRowText;
+      const renderedLines = renderRowText(row, rowTextOptions);
+
+      const globalColumnOffset = resolveCopyVisualLineOffset({
+        context,
+        copySide,
+        lineNumberDigits: geometry.lineNumberDigits,
+        row,
       });
-
-      if (!copyDecorations) {
-        const codeColumnOffset =
-          row.kind === "diff-row" && row.row.type === "stack-line"
-            ? DIFF_RAIL_PREFIX_WIDTH +
-              resolveStackCellGeometry(
-                width,
-                geometry.lineNumberDigits,
-                showLineNumbers,
-                DIFF_RAIL_PREFIX_WIDTH,
-              ).gutterWidth
-            : row.kind === "diff-row" && row.row.type === "split-line" && copySide
-              ? (copySide === "right" ? resolveSplitPaneWidths(width).leftWidth : 0) +
-                DIFF_RAIL_PREFIX_WIDTH +
-                resolveSplitCellGeometry(
-                  copySide === "right"
-                    ? width - resolveSplitPaneWidths(width).leftWidth
-                    : resolveSplitPaneWidths(width).leftWidth,
-                  geometry.lineNumberDigits,
-                  showLineNumbers,
-                  DIFF_RAIL_PREFIX_WIDTH,
-                ).gutterWidth
-              : 0;
-
-        for (let lineIndex = 0; lineIndex < renderedLines.length; lineIndex += 1) {
-          const lineVisualRow = rowTop + lineIndex;
-          if (lineVisualRow < startRow || lineVisualRow > endRow) {
-            continue;
-          }
-
-          const line = renderedLines[lineIndex] ?? "";
-          const startColumn =
-            start.kind === "review-row" && lineVisualRow === start.visualRow
-              ? Math.max(0, start.column - codeColumnOffset)
-              : 0;
-          const endColumn =
-            end.kind === "review-row" && lineVisualRow === end.visualRow
-              ? Math.max(0, end.column - codeColumnOffset)
-              : Number.MAX_SAFE_INTEGER;
-          const copiedLine = trimCopiedLine(sliceLineByCells(line, startColumn, endColumn));
-          if (copiedLine) {
-            lines.push(copiedLine);
-          }
+      for (const [lineIndex, text] of renderedLines.entries()) {
+        const copiedLine = clipSelectedVisualLine(
+          {
+            visualRow: rowTop + lineIndex,
+            text,
+            globalColumnOffset,
+            retainEmpty: copyDecorations,
+          },
+          start,
+          end,
+        );
+        if (copiedLine !== null) {
+          lines.push(copiedLine);
         }
-        continue;
-      }
-
-      // In split layout, `side` selects which pane text to render via
-      // renderDecoratedPlannedRowText. The returned lines start at the pane boundary,
-      // not at global column 0. Global column values from the selection points must be
-      // adjusted by subtracting the left-pane offset when side="right" so the slice
-      // aligns with the actual rendered string.
-      const paneOffset =
-        copySide === "right" && context.layout === "split"
-          ? resolveSplitPaneWidths(context.width).leftWidth
-          : 0;
-
-      for (let lineIndex = 0; lineIndex < renderedLines.length; lineIndex += 1) {
-        const lineVisualRow = rowTop + lineIndex;
-        if (lineVisualRow < startRow || lineVisualRow > endRow) {
-          continue;
-        }
-
-        const line = renderedLines[lineIndex] ?? "";
-        const startColumn =
-          start.kind === "review-row" && lineVisualRow === start.visualRow
-            ? Math.max(0, start.column - paneOffset)
-            : 0;
-        const endColumn =
-          end.kind === "review-row" && lineVisualRow === end.visualRow
-            ? Math.max(0, end.column - paneOffset)
-            : Number.MAX_SAFE_INTEGER;
-        lines.push(trimCopiedLine(sliceLineByCells(line, startColumn, endColumn)));
       }
     }
   }
 
   return lines.join("\n").replace(/\n+$/g, "");
-}
-
-export interface CopySelectedRowRange {
-  /** Global column where the selection starts on this row. */
-  startCol: number;
-  /** Global column where the selection ends on this row (inclusive). */
-  endCol: number;
 }
 
 /**
@@ -448,7 +568,14 @@ export function expandSelectionPoint(
   clickCount: 2 | 3,
   context: CopySelectionContext,
 ): { startCol: number; endCol: number } | null {
-  const { fileSectionLayouts, layout, sectionGeometry, showLineNumbers, width } = context;
+  const {
+    fileSectionLayouts,
+    layout,
+    reserveAddNoteColumn,
+    sectionGeometry,
+    showLineNumbers,
+    width,
+  } = context;
 
   // Find the section and row at this visual row.
   for (const section of fileSectionLayouts) {
@@ -495,43 +622,33 @@ export function expandSelectionPoint(
     // Double-click: expand to word boundaries within the code content (excluding rail/gutter).
     const side = resolveCopySelectionSide(point.column, layout, width);
 
-    // Compute how many global columns the prefix and gutter consume so we can convert between
-    // code-local and global column spaces.
-    let globalContentStart: number;
-    if (layout === "split") {
-      const { leftWidth } = resolveSplitPaneWidths(width);
-      const paneOffset = side === "left" ? 0 : leftWidth;
-      const paneWidth = side === "left" ? leftWidth : width - leftWidth;
-      const { gutterWidth } = resolveSplitCellGeometry(
-        paneWidth,
-        geometry.lineNumberDigits,
-        showLineNumbers,
-        DIFF_RAIL_PREFIX_WIDTH,
-      );
-      globalContentStart = paneOffset + DIFF_RAIL_PREFIX_WIDTH + gutterWidth;
-    } else {
-      const { gutterWidth } = resolveStackCellGeometry(
-        width,
-        geometry.lineNumberDigits,
-        showLineNumbers,
-        DIFF_RAIL_PREFIX_WIDTH,
-      );
-      globalContentStart = DIFF_RAIL_PREFIX_WIDTH + gutterWidth;
+    const rowTextOptions = {
+      codeHorizontalOffset: context.codeHorizontalOffset,
+      lineNumberDigits: geometry.lineNumberDigits,
+      reserveAddNoteColumn,
+      showHunkHeaders: context.showHunkHeaders,
+      showLineNumbers,
+      side,
+      width,
+      wrapLines: context.wrapLines,
+    };
+    const codeLayout = planCodeRowLayout(row, rowTextOptions);
+
+    // Compute how many global columns the planned prefix and gutter consume so we can convert
+    // between code-local and global column spaces.
+    let globalContentStart = 0;
+    if (codeLayout?.kind === "split") {
+      const cell = side === "left" ? codeLayout.left : codeLayout.right;
+      globalContentStart =
+        (side === "left" ? 0 : codeLayout.leftPaneWidth) + cell.prefixWidth + cell.gutterWidth;
+    } else if (codeLayout?.kind === "stack") {
+      globalContentStart = codeLayout.cell.prefixWidth + codeLayout.cell.gutterWidth;
     }
 
     const lineIndex = bodyRow - geometry.rowBounds[rowIndex]!.top;
 
     // Use code-only text so word detection ignores the rail, line numbers, and diff signs.
-    const codeText = renderCodeOnlyPlannedRowText(row, {
-      codeHorizontalOffset: context.codeHorizontalOffset,
-      lineNumberDigits: geometry.lineNumberDigits,
-      showHunkHeaders: context.showHunkHeaders,
-      showLineNumbers,
-      side,
-      theme: context.theme,
-      width,
-      wrapLines: context.wrapLines,
-    });
+    const codeText = renderCodeOnlyPlannedRowText(row, rowTextOptions);
 
     const lineText = codeText[lineIndex];
     if (lineText === undefined || lineText.length === 0) {
@@ -628,31 +745,10 @@ export function buildCopySelectedRowKeys({
         continue;
       }
 
-      // Determine the global column range for this planned row.
-      // For unwrapped rows (height=1) this is straightforward.
-      // For wrapped rows (height>1) the same row key spans multiple visual rows;
-      // we use the visual row that overlaps the selection boundary to decide.
-      const rowLastVisualRow = rowBottom - 1;
-      let rangeStartCol: number;
-      let rangeEndCol: number;
-
-      if (rowTop >= startRow && rowLastVisualRow <= endRow) {
-        // Row is fully inside the selection range.
-        rangeStartCol = rowTop === startRow ? start.column : 0;
-        rangeEndCol = rowLastVisualRow === endRow ? end.column : width - 1;
-      } else if (rowTop <= startRow && rowLastVisualRow >= startRow && rowLastVisualRow <= endRow) {
-        // Row starts above the selection and the last visual row is within it.
-        rangeStartCol = start.column;
-        rangeEndCol = rowLastVisualRow === endRow ? end.column : width - 1;
-      } else if (rowTop >= startRow && rowTop <= endRow && rowLastVisualRow >= endRow) {
-        // Row starts within the selection and extends past it.
-        rangeStartCol = rowTop === startRow ? start.column : 0;
-        rangeEndCol = end.column;
-      } else {
-        // Row spans across the entire selection (starts above, ends below).
-        rangeStartCol = start.column;
-        rangeEndCol = end.column;
-      }
+      // A row crossing either inclusive selection boundary inherits that boundary's column.
+      // Otherwise the row is selected across the full content width.
+      const rangeStartCol = rowTop <= startRow ? start.column : 0;
+      const rangeEndCol = rowBottom > endRow ? end.column : width - 1;
 
       const fileRows = selected.get(section.fileId) ?? new Map<string, CopySelectedRowRange>();
       fileRows.set(rowBounds.key, { startCol: rangeStartCol, endCol: rangeEndCol });

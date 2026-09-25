@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -17,6 +19,27 @@ import {
   releaseNpmDir,
 } from "./prebuilt-package-helpers";
 import { envWithPath, npmCommand } from "./script-helpers";
+
+/** Return whether an installed dependency tree contains Bun's npm packages. */
+function containsBunPackage(root: string) {
+  if (!existsSync(root)) return false;
+
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) continue;
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "bun" && path.basename(directory) === "node_modules") return true;
+        if (entry.name.startsWith("bun-") && path.basename(directory) === "@oven") return true;
+        pending.push(entryPath);
+      }
+    }
+  }
+
+  return false;
+}
 
 function run(command: string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv }) {
   const proc = Bun.spawnSync(command, {
@@ -85,8 +108,17 @@ try {
   // but the Windows `hunk.cmd` shim does not need bash on PATH.
   const bashDir = process.platform === "win32" ? undefined : commandDirectory("bash");
 
+  // Artifact transfer normalizes file modes before the publish job. Reproduce
+  // that boundary so this test proves npm restores execution from the platform
+  // package's `bin` declaration rather than relying on the staged mode.
+  const smokePlatformDir = path.join(smokeMetaDir, hostSpec.packageName);
+  cpSync(path.join(releaseRoot, hostSpec.packageName), smokePlatformDir, { recursive: true });
+  if (process.platform !== "win32") {
+    chmodSync(path.join(smokePlatformDir, "bin", binaryFilenameForSpec(hostSpec)), 0o644);
+  }
+
   run([npmCommand, "pack", "--pack-destination", packageDir], {
-    cwd: path.join(releaseRoot, hostSpec.packageName),
+    cwd: smokePlatformDir,
   });
 
   const platformTarball = path.join(packageDir, `${hostSpec.packageName}-${packageVersion}.tgz`);
@@ -130,6 +162,19 @@ try {
     binaryFilenameForSpec(hostSpec),
   );
   const commandEnv = envWithPath(sanitizedPath);
+  const pierreInstallCandidates = [
+    path.join(installedPackageRoot, "node_modules", "@pierre", "diffs"),
+    path.join(path.dirname(installedPackageRoot), "@pierre", "diffs"),
+    path.join(installDir, "node_modules", "@pierre", "diffs"),
+  ];
+
+  if (pierreInstallCandidates.some((candidate) => existsSync(candidate))) {
+    throw new Error("Expected a CLI-only Hunk install to omit the optional @pierre/diffs peer.");
+  }
+
+  if (containsBunPackage(installDir)) {
+    throw new Error("Expected a prebuilt Hunk install to omit bun and @oven/bun-* packages.");
+  }
 
   if (process.platform !== "win32") {
     const installedBinaryMode = statSync(installedPlatformBinary).mode & 0o777;

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
 import { platform } from "node:os";
-import type { SessionCommandInput } from "../../core/types";
+import type { SessionCommandInput } from "../../core/run/commandInputs";
 import { createTestListedSession } from "../../../test/helpers/session-daemon-fixtures";
 import {
   runSessionCommand,
@@ -141,7 +141,6 @@ describe("text output formatting", () => {
   test("renders reload, comment-add, and comment-clear as non-empty text", async () => {
     setSessionCommandTestHooks({
       resolveDaemonAvailability: async () => true,
-      restartDaemonForMissingAction: async () => {},
       createClient: () => createFakeClient(),
     });
 

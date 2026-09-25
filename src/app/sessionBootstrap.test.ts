@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { HunkConfigResolution } from "../core/config";
-import type { AppBootstrap, CliInput } from "../core/types";
+import { fileLanguageForPath } from "../core/changeset/fileLanguageLookup";
+import { replaceExtensionFileLanguages } from "../core/changeset/fileLanguage";
+import type { HunkConfigResolution } from "../core/run/config";
+import type { AppBootstrap } from "../core/bootstrap";
+import type { CliInput } from "../core/run/commandInputs";
 import { createEmptyExtensionLoadResult } from "../extensions/types";
 import { loadConfiguredSessionBootstrap } from "./sessionBootstrap";
 
@@ -53,5 +56,37 @@ describe("loadConfiguredSessionBootstrap", () => {
     expect(result.bootstrap.initialThemeMode).toBe("dark");
     expect(result.bootstrap.keybindings).toEqual({ "hunk.review.nextHunk": "]" });
     expect(result.bootstrap.viewPreferencesConfigPath).toBe("/tmp/hunk-config.toml");
+  });
+
+  test("restores the active file-language selectors when bootstrap loading fails", async () => {
+    replaceExtensionFileLanguages([
+      {
+        matcher: { kind: "filename", value: "CurrentHunkfile" },
+        language: "python",
+      },
+    ]);
+    const input = createTestInput();
+    const extensions = createEmptyExtensionLoadResult();
+    extensions.registry.fileLanguages.push({
+      extensionId: "replacement",
+      matcher: { kind: "filename", value: "ReplacementHunkfile" },
+      language: "ruby",
+    });
+
+    await expect(
+      loadConfiguredSessionBootstrap({
+        configured: createTestConfig(input),
+        cwd: process.cwd(),
+        extensions,
+        loadAppBootstrapImpl: async () => {
+          expect(fileLanguageForPath("ReplacementHunkfile")).toBe("ruby");
+          throw new Error("load failed");
+        },
+      }),
+    ).rejects.toThrow("load failed");
+
+    expect(fileLanguageForPath("CurrentHunkfile")).toBe("python");
+    expect(fileLanguageForPath("ReplacementHunkfile")).toBe("text");
+    replaceExtensionFileLanguages([]);
   });
 });

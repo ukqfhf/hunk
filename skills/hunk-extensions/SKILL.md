@@ -1,6 +1,6 @@
 ---
 name: hunk-extensions
-description: Maps the `hunkdiff/extension` authoring surface for Hunk, the terminal diff viewer — hiding or reordering reviewed files, sidebar panes, alternate file views, commands and key bindings, dialogs, workspace writes, themes, syntax languages, VCS backends, lifecycle events. Use when writing, debugging, or installing a Hunk extension, or when a request asks Hunk itself to behave differently. Not for reviewing a diff in a live session — that is hunk-review.
+description: Maps the `hunkdiff/extension` authoring surface for Hunk, the terminal diff viewer — hiding or reordering reviewed files, docked panes, alternate file views, commands and key bindings, dialogs, workspace writes, themes, syntax languages, VCS backends, lifecycle events. Use when writing, debugging, or installing a Hunk extension, or when a request asks Hunk itself to behave differently. Not for reviewing a diff in a live session — that is hunk-review.
 ---
 
 # Building Hunk extensions
@@ -34,12 +34,12 @@ material before writing code.
 
 Outside a Hunk checkout the guide is split across
 <https://hunk.dev/docs/extend/extensions/> (discovery, trust, config) and its
-companion pages — extension-api, file-previews, vcs-adapters, custom-sidebars —
+companion pages — extension-api, file-previews, vcs-adapters, custom-panes —
 and the contract ships as `node_modules/hunkdiff/dist/npm/extension/index.d.ts`.
 
 The examples, by what they demonstrate:
 
-- `review-triage/` — sidebar + commands + all three dialog shapes + lifecycle
+- `review-triage/` — pane + commands + all three dialog shapes + lifecycle
   events + the extension event bus + a `useSyncExternalStore` bridge.
 - `inline-edit/` — an interactive file-view `mode` driving `ctx.workspace` writes;
   its README explains the async lifetime rules better than anything else in tree.
@@ -68,36 +68,79 @@ one level of folder extensions. A folder is an extension if it has a
 `package.json` with `{"hunk": {"extensions": ["./index.ts"]}}`, or an
 `index.{ts,tsx,js,jsx,mjs}`. Reach for a folder only when you need npm
 dependencies, helper modules, or a README; a single file keeps the install to one
-`cp`. Hunk never installs anything, so a folder extension's `node_modules` has to
-exist on every machine that loads it — keep a repo-shared extension
-dependency-free.
+`cp`. A `.hunk/extensions/` folder extension's `node_modules` has to exist on
+every machine that loads it — keep a repo-shared extension dependency-free.
+
+Shared extensions install from git with `hunk extension install <source>`
+(`owner/repo[@ref]`, `git:host/path[@ref]`, a git URL, or a local path) into
+`~/.config/hunk/extensions/installed/<repo-name>/`, where they load with global
+origin; `list`, `update`, and `remove` manage them. Declared `dependencies` are
+`bun install`ed at install time. The manifest may state
+`{"hunk": {"apiVersion": N}}` — the minimum extension API version — and an older
+Hunk refuses the extension with a startup notice instead of failing mid-factory.
+To publish, push the folder-extension layout to a git repository's root with
+real `name`/`version`/`description`, tag releases for `@ref` pins, and add the
+`hunk-extension` GitHub topic so it appears at
+<https://github.com/topics/hunk-extension>.
 
 The **id** is the file stem, or the folder name for a folder extension — unless
 its manifest declares several entries, in which case each entry is its own
 extension named by its own stem (numeric suffix on collision). The id is the
-namespace it owns: commands are `<id>.<commandId>`, sidebar views
-`<id>:<viewId>`, config `[extension.<id>]`. Ids match
+namespace it owns: commands are `<id>.<commandId>`, panes and keyboard modes
+are `<id>:<localId>`, config `[extension.<id>]`. Ids match
 `/^[A-Za-z0-9][A-Za-z0-9_-]*$/`; `hunk`, `arc`, `git`, `jj`, and `sl` are reserved. A
 bad or duplicate id is skipped with a startup notice.
 
 ## Pick the touchpoint
 
-| To do this                                              | Call                                         |
-| ------------------------------------------------------- | -------------------------------------------- |
-| Add a selectable color theme                            | `hunk.registerTheme(theme)`                  |
-| Highlight an unrecognized file extension                | `hunk.registerFileLanguage(ext, lang)`       |
-| Support another VCS (`git`/`jj`/`sl` are reserved)      | `hunk.registerVcsAdapter(adapter)`           |
-| Add a navigation/list/status pane beside the review     | `hunk.registerSidebarView(view)`             |
-| Present a file as something other than a raw diff       | `hunk.registerFileView(view)` (experimental) |
-| Bind a key / add an Extensions-menu entry               | `hunk.registerCommand(command, handler)`     |
-| Hide, reorder, retitle files before review              | `hunk.transformChangeset(fn)`                |
-| React to loads, selection, viewed files, notes, reloads | `hunk.on(event, handler)`                    |
-| Coordinate with another loaded extension                | `hunk.events.emit` / `hunk.events.on`        |
-| Read user-supplied settings                             | `hunk.config` (`[extension.<id>]` table)     |
-| Branch on the API generation (currently `3`)            | `hunk.apiVersion`                            |
+| To do this                                               | Call                                         |
+| -------------------------------------------------------- | -------------------------------------------- |
+| Keep demo/training view settings temporary               | `hunk.configureSession(options)`             |
+| Add a selectable color theme                             | `hunk.registerTheme(theme)`                  |
+| Highlight an extension, exact filename, or filename glob | `hunk.registerFileLanguage(matcher, lang)`   |
+| Support another VCS (`arc`/`git`/`jj`/`sl` are reserved) | `hunk.registerVcsAdapter(adapter)`           |
+| Add a navigation/list/status pane beside the review      | `hunk.registerPane(pane)`                    |
+| Present a file as something other than a raw diff        | `hunk.registerFileView(view)` (experimental) |
+| Mark character ranges inside diff lines                  | `hunk.registerLineHighlighter(highlighter)`  |
+| Interpret review keys as a temporary global mode         | `hunk.registerKeyboardMode(mode)`            |
+| Add a generic top-level CLI command tree                 | `hunk.registerCliCommand(command, handler)`  |
+| Bind a key / add an Extensions-menu entry                | `hunk.registerCommand(command, handler)`     |
+| Hide, reorder, retitle files before review               | `hunk.transformChangeset(fn)`                |
+| React to loads, selection, view movement, notes, reloads | `hunk.on(event, handler)`                    |
+| Coordinate with another loaded extension                 | `hunk.events.emit` / `hunk.events.on`        |
+| Read user-supplied settings                              | `hunk.config` (`[extension.<id>]` table)     |
+| Snapshot stable files and every saved review note        | `ctx.review.snapshot()` in a command         |
+| Branch on the API generation (currently `15`)            | `hunk.apiVersion`                            |
 
 Registration is only valid while the factory runs — Hunk seals the API object
 afterwards.
+
+### Generic CLI handlers
+
+Register one lowercase-kebab top-level token; the handler owns every raw token
+below it. Built-ins and aliases cannot be shadowed, and discovery order makes
+the first extension claim win. During development, place the explicit path
+before the extension command:
+
+```bash
+hunk --extension ./my-ext.ts my-command sync --help
+```
+
+The handler receives frozen args plus `ctx.cwd`, `ctx.signal`, streaming
+`ctx.stdin`, and leased `ctx.stdout`/`ctx.stderr` writers. `summary` and
+`usage` are listed when a token reaches discovery unclaimed, so write them as
+one short line each. Return `{ kind:
+"exit", code? }` or `{ kind: "delegate", argv: ["diff", ...] }`. Delegation is
+built-in-only and one-time: do not write stdout or read stdin before delegating;
+use stderr for progress. Reading stdin is an exit-only workflow. Respect cancellation promptly.
+Repo-local providers remain trust-gated; `--no-extensions` performs no discovery
+or import, while a leading explicit `--extension` path is immediate consent.
+
+Use `examples/extensions/github-pr/` as the reference for a complete CLI
+preprocessor: direct authenticated HTTP with cancellation, temporary artifacts
+with platform-accurate permission claims retained through delegated startup,
+cleanup on `shutdown`, and a
+one-time handoff to built-in `patch` without touching stdin or stdout.
 
 ## What handlers receive
 
@@ -105,27 +148,39 @@ Every event, bus, command, and file-view mode handler — plus every changeset
 transform — gets `ctx.cwd` and `ctx.notify(message, type?)`. A file view's
 `matches` and `layout` get no context at all. Beyond that:
 
-- **Event and bus handlers** also get `ctx.sidebars` (open/close/toggle/isOpen on
-  any view) and `ctx.events.emit`.
-- **Command handlers** get `ctx.sidebars`, `ctx.fileViews` (select/toggle/isActive/
-  refresh/enterMode/exitMode), `ctx.selection` (a snapshot of file + hunk index),
-  `ctx.navigation` (live, guarded `selectFile`/`selectHunk`), `ctx.commands`
-  (`isEnabled`/`execute` for public semantic `hunk.*` commands), `ctx.dialogs`
-  (`confirm`/`select`/`input`, queued and attributed), and `ctx.workspace`
-  (`readDocument`, `canWriteDocument`, `writeDocument` with consent).
-- **Sidebar components** get props: `files` (frozen, filtered, review order, each
-  with `hunks` summaries), `selectedFileId`, `selectedHunkIndex`, `width`,
-  `theme` (hex tokens plus an `appearance` flag — see `ExtensionPaintTheme`),
-  `keybindings` (ask by command id, never hard-code a chord), and `actions`
-  (`selectFile`, `selectHunk`, `notify`).
+- **Event and bus handlers** also get `ctx.panes` (open/close/toggle/isOpen on
+  any pane), live `ctx.navigation`, attributed `ctx.dialogs`, and
+  `ctx.events.emit`. `ctx.sidebars` is a deprecated alias for `ctx.panes`.
+- **Command handlers** get `ctx.panes`, `ctx.fileViews` (select/toggle/isActive/
+  refresh/enterMode/exitMode), `ctx.highlights` (refresh prepared line marks,
+  whole or `{ fileId }`-scoped), `ctx.selection` (a snapshot of file, hunk index,
+  and nullable current `{ side, line }` source address), `ctx.navigation` (live,
+  guarded `selectFile`/`selectHunk`/`revealLine`, the
+  last landing one exact `(side, line)` near the viewport top), `ctx.commands`
+  (`isEnabled`/`execute` for public semantic `hunk.*` commands),
+  `ctx.keyboardModes` (enter/exit/probe this extension's session modes), `ctx.review`
+  (deeply immutable snapshots of stable files and complete saved store notes),
+  `ctx.dialogs` (`confirm`/`select`/`input`, queued and attributed), and
+  `ctx.workspace` (`readDocument`, `canWriteDocument`, `writeDocument` with consent).
+- **Pane components** get frozen `files`, selection, placement, exact dimensions,
+  optional `currentLine` paint (with `{ side, line }` when opted in), semantic `theme`, resolved `keybindings`, and
+  guarded navigation/notification `actions`.
 - **File-view `layout`** gets `file`, `width`, `signal`, `changes`, and a lazy
   `readDocument(side)`.
-- **File-view `mode` handlers** get `ctx.file` and `ctx.fileViews`. `onKey` must
-  answer **synchronously** — its return value (`"handled"`/`"pass"`/`"exit"`) is
-  the routing decision, so kick off async work and report it later through
-  `notify` or `refresh`. Escape is host-owned and never reaches `onKey`.
+- **File-view `mode` handlers** get `ctx.file` and `ctx.fileViews`. `onKey`,
+  `onEnter`, and `onExit` must answer **synchronously** — `onKey`'s return value
+  (`"handled"`/`"pass"`/`"exit"`) is the routing decision, so kick off async work
+  and report it later through `notify` or `refresh`. A passed key reaches any
+  active session keyboard mode before ordinary Hunk routing. Escape is host-owned
+  and never reaches `onKey`.
+- **Session keyboard-mode handlers** get only `ctx.commands` and activation-scoped
+  `ctx.keyboardModes` beyond the standard context. Those controls become inert on
+  exit, and lifecycle callbacks cannot change keyboard ownership. Keys are frozen
+  snapshots; dialogs, focused inputs, and file-view modes outrank them. When the
+  session mode owns input, Escape exits it; the status badge and Extensions menu
+  are unconditional host-owned exits.
 
-Event payloads, sidebar props, and a command's selection all hand you frozen
+Event payloads, pane props, and a command's selection all hand you frozen
 `ExtensionDiffFile` / `ExtensionDiffHunk` views. A changeset transform is the
 exception: it receives the live changeset and is expected to return a new one.
 `metadata` is unfrozen either way — it is the renderer's parsed diff, so pass it
@@ -135,11 +190,9 @@ through untouched.
 
 Most extension bugs are one of these:
 
-- **Registering a surface does not show it.** A sidebar view starts closed unless
-  it declares `defaultOpen` (or `replacesDefault`, which starts open in place of
-  the built-in file list). A file view never activates itself — raw diff is the
-  default and the user picks the view from the **View** menu. Ship a command that
-  toggles it and say which key, or correct code looks like it did nothing.
+- **Registering a surface does not show it.** Panes need `defaultOpen`,
+  `replaces: "hunk:files"`, or a command that opens them. File views remain raw
+  until selected from the **View** menu.
 - **A rejected file-view layout silently becomes raw diff.** `hunkRows` needs one
   in-bounds, inclusive entry per parsed hunk at the same array index, and
   `sourceRanges` may not overlap on a side; invalid, oversized, cancelled, and
@@ -154,6 +207,19 @@ Most extension bugs are one of these:
 - **Handler state must live outside the component.** Panes unmount when closed;
   bridge module-level state into React with `useSyncExternalStore` and immutable
   snapshots (`review-triage/index.tsx` is the working version).
+- **Use `ctx.review.snapshot()` for complete saved-note state.** `note_created` and
+  `note_edited` are incremental UI events, not an authoritative collection. Snapshots
+  include stale and orphaned saved notes, exclude drafts and static sidecar annotations,
+  and should be re-read before irreversible async work; compare both generation and revision.
+  `review-note-navigator` shows how to join stable note ids and file keys back to guarded
+  navigation after awaiting a selector; file filters can still refuse hidden targets.
+- **Retained review controls expire on reload.** An old handler cannot control
+  replacement content: pane/navigation calls become inert, dialogs cancel, and
+  workspace reads or not-yet-started writes return `null`/`unavailable`. A
+  consented write already in progress reports its real outcome, holds graceful
+  exit until it settles, and reconciles the active review on success. `shutdown`
+  runs after revocation, so use it only
+  to release extension-owned resources.
 - **A reload keeps your factory and renames the files.** Factories re-run only
   after a trust grant or a cwd change, so module state survives — but a file's
   `id` encodes its position in the changeset, so a reload that adds or drops a
@@ -165,6 +231,11 @@ Most extension bugs are one of these:
 - **Chords are defaults.** Users remap by command id in `[keybindings]`; built-ins
   win conflicts, refused one chord at a time. Bind the character shift produces
   (`"!"`, not `"shift+1"`).
+- **Keyboard modes are grammar, not behavior.** Keep pending sequences and
+  numeric prefixes in the extension, then call one public `ctx.commands.execute`
+  after resolving an action. `vim-navigation` demonstrates counts, Ctrl chords,
+  and a `:` key passed to a registered command whose host input dialog temporarily
+  outranks the still-active mode.
 - **`ctx.commands` invokes Hunk, not other extensions.** Probe with
   `isEnabled("hunk.review.nextHunk")`, then call `execute(id, { count })` for an
   explicitly public built-in. Counts are positive whole numbers up to 10,000,
@@ -216,7 +287,7 @@ Practical checks, in order of cost:
    loads immediately with no trust prompt, so it is the iteration path. Ask them
    what the footer notices and toasts said.
 5. **Triage with `--no-extensions`** to confirm a symptom belongs to an extension
-   (bundled VCS backends and the built-in sidebar stay loaded either way).
+   (bundled VCS backends and the built-in files pane stay loaded either way).
 
 ## If it does not load
 
@@ -227,9 +298,9 @@ Practical checks, in order of cost:
   claimed), import failure, missing default export, or a throwing factory.
 - Repo-local extension silently absent → the trust prompt was dismissed or denied;
   decisions are stored per repo root in `~/.config/hunk/state.json`.
-- Sidebar pane closes with a toast → the component threw; a second React copy is
+- Pane closes with a toast → the component threw; a second React copy is
   the usual cause.
-- Sidebar or file view never appears → nothing opened it (no `defaultOpen`, no
+- Pane or file view never appears → nothing opened it (no `defaultOpen`, no
   command), `matches` returned false, or the layout was rejected.
 - Command never fires → its chord lost to a built-in or an earlier extension (a
   warning says so); it is still reachable from the **Extensions** menu and
@@ -239,7 +310,7 @@ Practical checks, in order of cost:
 
 Only when the work is in the `hunk` repo rather than in a user extension:
 
-- Shipped VCS backends and the built-in sidebar are **bundled extensions** in
+- Shipped VCS backends and the built-in files pane are **bundled extensions** in
   `src/extensions/default/`, registering through the same public API. That
   dogfooding is deliberate — if the public contract cannot express something,
   that is a real gap, not a reason for a private path. `default/vcs/` loads from

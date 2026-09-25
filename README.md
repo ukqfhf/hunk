@@ -7,6 +7,7 @@ Hunk is a review-first terminal diff viewer for agent-authored changesets, built
 [![CI status](https://img.shields.io/github/actions/workflow/status/modem-dev/hunk/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/modem-dev/hunk/actions/workflows/ci.yml?branch=main)
 [![Latest release](https://img.shields.io/github/v/release/modem-dev/hunk?style=for-the-badge)](https://github.com/modem-dev/hunk/releases)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
+[![Join the Discord community](https://img.shields.io/badge/Discord-Join%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/WZFjaP6Gt8)
 
 - multi-file review stream with sidebar navigation
 - inline AI and agent annotations beside the code
@@ -31,26 +32,43 @@ Hunk is a review-first terminal diff viewer for agent-authored changesets, built
 
 ## Install
 
+The default installation method on macOS and Linux downloads a standalone binary and installs it into `~/.hunk`. It checks the archive against the release checksum when both `SHA256SUMS` and a supported checksum tool are available, and warns otherwise:
+
 ```bash
-npm i -g hunkdiff
+curl -fsSL https://hunk.dev/install.sh | sh
 ```
 
-Or with Homebrew:
+Windows users can install with npm or mise. Other installation methods are also available:
 
 ```bash
-brew install hunk
+npm i -g hunkdiff                    # macOS, Linux, or Windows; requires Node.js 22+
+brew install hunk                    # macOS or Linux
+mise use -g hunk                     # macOS, Linux, or Windows
 ```
 
 > [!NOTE]
 > If you previously installed hunk via `modem-dev/tap`, be sure to uninstall it first with `brew uninstall modem-dev/tap/hunk`.
 
+Windows requires mise 2026.8.6 or newer. Nix users can use the `default` package exported in `flake.nix`; see [nix/README.md](./nix/README.md) for details. Hunk also ships as a default tool in [Omarchy](https://omarchy.org), installed through mise.
+
 Requirements:
 
-- Node.js 18+
 - macOS, Linux, or Windows
+- On x86-64, a CPU with SSE4.2 (Intel Nehalem 2008+, AMD Bulldozer 2011+); arm64 has no CPU feature floor
+- Node.js 22+ for the npm install; the install script, Homebrew, mise, and Nix ship a standalone binary that does not require Node.js
 - Git recommended for most workflows
 
-> Nix users can use the `default` package exported in `flake.nix` instead. See [nix/README.md](./nix/README.md) for details.
+### Update Hunk
+
+Starting with Hunk 0.20, npm, Homebrew, and default install-script installs use Hunk’s canonical update command:
+
+```bash
+hunk update          # install the newest release
+hunk update --check  # check without installing
+hunk update 0.20.0   # select an exact npm or default install-script release
+```
+
+On an older release, update once with the installer or package manager that installed Hunk, then use `hunk update` going forward. Custom `HUNK_INSTALL_DIR` installs must re-run the installer with the same directory; mise, Nix, and source installs use their owning tools instead.
 
 ## Quick start
 
@@ -65,6 +83,7 @@ Hunk mirrors Git's diff-style commands, but opens the changeset in a review UI i
 
 ```bash
 hunk diff                      # review current repo changes, including untracked files
+hunk --fast                    # experimentally offload eligible syntax highlighting
 hunk diff --watch              # auto-reload as the working tree changes
 hunk show                      # review the latest commit
 hunk show HEAD~1               # review an earlier commit
@@ -92,8 +111,8 @@ entire checkout.
 ### Working with raw files and patches
 
 ```bash
-hunk diff before.ts after.ts                # compare two files directly
-hunk diff before.ts after.ts --watch        # auto-reload when either file changes
+hunk diff --files before.ts after.ts        # compare two files directly
+hunk diff --files before.ts after.ts --watch # auto-reload when either file changes
 git diff --no-color | hunk patch -          # review a patch from stdin
 ```
 
@@ -147,9 +166,12 @@ vcs = "git"          # git, jj, sl, arc
 watch = false
 exclude_untracked = false
 line_numbers = true
-tab_width = 4       # tab stops, 1-16
+tab_width = 4        # tab stops, 1-16
+file_gap = 1         # rows between files, including the ─ rule; 0 hides it
+hunk_gap = 0         # blank rows before later hunks
 wrap_lines = false
 menu_bar = true
+sidebar = "auto"     # "auto", true, false
 agent_notes = false
 prompt_save_view_preferences = true
 transparent_background = false
@@ -161,6 +183,7 @@ syntax scopes, and legacy syntax-table migration.
 
 `exclude_untracked` affects Git, Sapling, and Arc working-tree `hunk diff` sessions only.
 `tab_width` controls source-code tab stops and can be overridden with `-x4` or `--tab-width 4`.
+`file_gap` is separator height between files, including the `─` rule; `hunk_gap` is blank rows before later hunks.
 `prompt_save_view_preferences = false` disables the quit prompt for saving changed view preferences.
 `transparent_background` can also be written as `transparentBackground`.
 
@@ -227,11 +250,11 @@ repository's `.hunk/extensions/` (after you explicitly trust that repository),
 and from `--extension <path>` for development. `--no-extensions` turns those off
 for one run; Hunk's own bundled backends (Arc, Git, Jujutsu, and Sapling) stay loaded.
 
-A Phase 1 extension can contribute themes and file-extension → language
-mappings, add a VCS backend, rewrite the changeset before review (collapse
-lockfiles, reorder files by review priority), replace the file-navigation
-sidebar with its own React component, react to lifecycle events, and show
-transient messages:
+An extension can add generic top-level CLI workflows, contribute themes and
+file-extension → language mappings, add a VCS backend, rewrite the changeset
+before review (collapse lockfiles, reorder files by review priority), replace
+the file-navigation sidebar with its own React component, react to lifecycle
+events, and show transient messages:
 
 ```ts
 // ~/.config/hunk/extensions/collapse-lockfiles.ts
@@ -246,10 +269,27 @@ export default function (hunk: HunkExtensionAPI) {
 }
 ```
 
+Extensions shared as git repositories install straight from their host, and a
+`hunk-extension` GitHub topic marks community ones:
+
+```bash
+hunk extension install acme/hunk-word-diff@v1.2.0   # or git:host/path, a URL, a local path
+hunk extension list                                 # then update [name] / remove <name>
+```
+
+Browse community extensions at
+[github.com/topics/hunk-extension](https://github.com/topics/hunk-extension);
+publish yours by pushing the extension to a repository root and adding that
+topic.
+
 See [docs/extensions.md](docs/extensions.md) for the full API, the trust model,
-and the `[extensions]` / `[extension.<id>]` config reference. Installable examples
-include [review triage](examples/extensions/review-triage/) and an optional
-[rendered Markdown file view](examples/extensions/rendered-markdown/).
+publishing guidance, and the `[extensions]` / `[extension.<id>]` config reference.
+Installable examples include a dependency-free
+[`hunk gh 123` GitHub PR workflow](examples/extensions/github-pr/),
+[review triage](examples/extensions/review-triage/),
+[authoritative review snapshot export](examples/extensions/review-snapshot-export/), an optional
+[rendered Markdown file view](examples/extensions/rendered-markdown/), and a
+[Vim navigation mode](examples/extensions/vim-navigation/) built from public semantic commands.
 
 ### OpenTUI component
 

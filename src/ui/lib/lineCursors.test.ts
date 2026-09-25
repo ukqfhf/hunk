@@ -4,15 +4,19 @@ import {
   createTestHeaderOnlyDiffFile,
   lines,
 } from "../../../test/helpers/diff-helpers";
-import type { DiffFile, LayoutMode } from "../../core/types";
-import { gapKey } from "../diff/expandCollapsedRows";
+import type { DiffFile } from "../../core/changeset/model";
+import type { LayoutMode } from "../../core/run/commandInputs";
+import { reviewGapId } from "../../core/review/expansion";
 import { measureDiffSectionGeometry } from "../diff/diffSectionGeometry";
 import { resolveTheme } from "../themes";
 import {
   buildLineCursors,
   clampLineCursorToViewport,
+  createLineCursorStabilizer,
+  findLineCursorAt,
   findNextLineCursor,
   firstLineCursorInHunk,
+  reuseEquivalentLineCursors,
   resolveLineCursor,
   type LineCursor,
 } from "./lineCursors";
@@ -155,7 +159,7 @@ describe("buildLineCursors", () => {
       120,
       true,
       false,
-      new Set([gapKey("before", 0)]),
+      new Set([reviewGapId("before", 0)]),
       { kind: "loaded", text: source },
     );
 
@@ -191,6 +195,99 @@ describe("buildLineCursors", () => {
 
   test("returns nothing when no files are visible", () => {
     expect(buildLineCursors([], [])).toEqual([]);
+  });
+});
+
+describe("reuseEquivalentLineCursors", () => {
+  test("keeps list identity when remeasurement preserves every cursor", () => {
+    const previous = cursorsFor([createContextWrappedFile("alpha", "alpha.ts")], "stack");
+    const next = previous.map((cursor) => ({ ...cursor, target: { ...cursor.target } }));
+
+    expect(reuseEquivalentLineCursors(previous, next)).toBe(previous);
+  });
+
+  test("keeps a changed cursor list", () => {
+    const previous = cursorsFor([createContextWrappedFile("alpha", "alpha.ts")], "stack");
+    const next = previous.map((cursor, index) =>
+      index === 0
+        ? { ...cursor, target: { ...cursor.target, line: cursor.target.line + 1 } }
+        : cursor,
+    );
+
+    expect(reuseEquivalentLineCursors(previous, next)).toBe(next);
+  });
+});
+
+describe("createLineCursorStabilizer", () => {
+  test("does not rescan an unchanged measurement during unrelated renders", () => {
+    const stabilize = createLineCursorStabilizer();
+    const measured = cursorsFor([createContextWrappedFile("alpha", "alpha.ts")], "stack");
+
+    expect(stabilize(measured)).toBe(measured);
+    expect(stabilize(measured)).toBe(measured);
+  });
+
+  test("preserves stable cursor identity across equivalent remeasurement", () => {
+    const stabilize = createLineCursorStabilizer();
+    const stable = cursorsFor([createContextWrappedFile("alpha", "alpha.ts")], "stack");
+    const measured = stable.map((cursor) => ({ ...cursor, target: { ...cursor.target } }));
+
+    expect(stabilize(stable)).toBe(stable);
+    expect(stabilize(measured)).toBe(stable);
+  });
+});
+
+describe("findLineCursorAt", () => {
+  /** Build a file whose inserted line pushes the trailing context onto different side numbers. */
+  function createShiftedContextFile() {
+    return createTestDiffFile({
+      id: "alpha",
+      path: "alpha.ts",
+      before: lines("one", "two", "three"),
+      after: lines("one", "inserted", "two", "three"),
+      context: 3,
+    });
+  }
+
+  test("finds a changed line by the side the patch numbers it on", () => {
+    const cursors = cursorsFor([createTwoHunkFile("alpha", "alpha.ts")], "stack");
+
+    expect(findLineCursorAt(cursors, "alpha", "new", 10)?.target).toEqual({
+      side: "new",
+      line: 10,
+    });
+    expect(findLineCursorAt(cursors, "alpha", "old", 10)?.target).toEqual({
+      side: "old",
+      line: 10,
+    });
+  });
+
+  test("answers a context row to either side's number, even once they diverge", () => {
+    // "three" is old line 3 and new line 4 after the insertion; both address the same row.
+    const cursors = cursorsFor([createShiftedContextFile()], "stack");
+    const byNew = findLineCursorAt(cursors, "alpha", "new", 4);
+    const byOld = findLineCursorAt(cursors, "alpha", "old", 3);
+
+    expect(byNew?.stableKey).toBe("line:0:context:3:4");
+    expect(byOld).toEqual(byNew);
+  });
+
+  test("stays inside the requested file when two files number the same line", () => {
+    const cursors = cursorsFor(
+      [createTwoHunkFile("alpha", "alpha.ts"), createTwoHunkFile("beta", "beta.ts")],
+      "stack",
+    );
+
+    expect(findLineCursorAt(cursors, "beta", "new", 1)?.fileId).toBe("beta");
+  });
+
+  test("finds no cursor for a line the stream draws no row for", () => {
+    // Line 3 is inside the collapsed gap above the only hunk, so nothing measures it.
+    const cursors = cursorsFor([createCollapsedGapFile()], "stack");
+
+    expect(findLineCursorAt(cursors, "alpha", "new", 3)).toBeNull();
+    expect(findLineCursorAt(cursors, "alpha", "new", 900)).toBeNull();
+    expect(findLineCursorAt(cursors, "missing", "new", 6)).toBeNull();
   });
 });
 

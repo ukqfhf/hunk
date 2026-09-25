@@ -14,6 +14,28 @@ export interface PlatformPackageSpec {
   binaryRelativePath: string;
 }
 
+export interface PackageDependencyManifest {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+}
+
+/** Remove Bun from dependencies shipped beside standalone prebuilt executables. */
+export function buildPrebuiltRuntimeDependencies(dependencies?: Record<string, string>) {
+  if (!dependencies) return undefined;
+
+  const { bun: _bundledRuntime, ...runtimeDependencies } = dependencies;
+  return runtimeDependencies;
+}
+
+/** Assert a staged prebuilt package cannot install Bun as a mandatory dependency. */
+export function assertNoMandatoryBunDependency(manifest: PackageDependencyManifest) {
+  if (manifest.dependencies?.bun !== undefined) {
+    throw new Error("Expected the staged prebuilt package to omit the mandatory bun dependency.");
+  }
+}
+
 const PLATFORM_NAME_MAP: Partial<Record<NodeJS.Platform, SupportedPlatform>> = {
   darwin: "darwin",
   linux: "linux",
@@ -119,6 +141,39 @@ export function buildOptionalDependencyMap(
   return Object.fromEntries(specs.map((spec) => [spec.packageName, version]));
 }
 
+/** Verify a package stays development-only and an optional peer after staging. */
+export function assertOptionalPeerDependencyContract(
+  root: PackageDependencyManifest,
+  staged: PackageDependencyManifest,
+  packageName: string,
+) {
+  const expectedVersion = root.devDependencies?.[packageName];
+
+  if (!expectedVersion) {
+    throw new Error(`Expected ${packageName} to remain a development dependency.`);
+  }
+  if (root.dependencies?.[packageName] !== undefined) {
+    throw new Error(`Expected ${packageName} to stay out of runtime dependencies.`);
+  }
+  if (
+    root.peerDependencies?.[packageName] !== expectedVersion ||
+    root.peerDependenciesMeta?.[packageName]?.optional !== true
+  ) {
+    throw new Error(
+      `Expected ${packageName}@${expectedVersion} to be an optional peer dependency.`,
+    );
+  }
+  if (staged.dependencies?.[packageName] !== undefined) {
+    throw new Error(`Expected staged ${packageName} to stay out of runtime dependencies.`);
+  }
+  if (
+    staged.peerDependencies?.[packageName] !== expectedVersion ||
+    staged.peerDependenciesMeta?.[packageName]?.optional !== true
+  ) {
+    throw new Error(`Expected the staged package to preserve the optional ${packageName} peer.`);
+  }
+}
+
 /** Return the executable filename for a platform package. */
 export function binaryFilenameForSpec(spec: PlatformPackageSpec) {
   return spec.os === "windows" ? `${spec.binaryName}.exe` : spec.binaryName;
@@ -127,9 +182,9 @@ export function binaryFilenameForSpec(spec: PlatformPackageSpec) {
 /**
  * Build the published manifest for one prebuilt platform package.
  *
- * Platform packages are implementation dependencies, so their native executables
- * stay out of `bin`; npm 11 rejects native files there as invalid scripts. The
- * staged executable bit and top-level wrapper preserve direct execution instead.
+ * Declaring the native executable in `bin` makes npm restore its execute bits
+ * during installation, including when release artifact transfer strips the
+ * staged mode before publishing.
  */
 export function buildPlatformPackageManifest(
   rootPackage: {
@@ -148,6 +203,9 @@ export function buildPlatformPackageManifest(
     description: `${rootPackage.description} (${spec.os} ${spec.cpu} binary)`,
     os: [spec.os === "windows" ? "win32" : spec.os],
     cpu: [spec.cpu],
+    bin: {
+      hunk: spec.binaryRelativePath,
+    },
     files: ["bin", "LICENSE"],
     repository: rootPackage.repository,
     homepage: rootPackage.homepage,

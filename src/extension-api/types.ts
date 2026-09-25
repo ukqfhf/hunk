@@ -21,10 +21,20 @@
  * Extensions can branch on `hunk.apiVersion` so a newer Hunk can keep loading
  * older extensions without guessing at their expectations.
  */
-export const HUNK_EXTENSION_API_VERSION = 3;
+export const HUNK_EXTENSION_API_VERSION = 16;
 export type HunkExtensionApiVersion = typeof HUNK_EXTENSION_API_VERSION;
 
 export type ExtensionNotifyType = "info" | "warning" | "error";
+
+/** Selects files whose syntax language an extension overrides. */
+export type ExtensionFileLanguageMatcher =
+  | { readonly kind: "extension"; readonly value: string }
+  | { readonly kind: "filename"; readonly value: string }
+  | {
+      readonly kind: "glob";
+      readonly value: string;
+      readonly target: "basename" | "path";
+    };
 
 /** Capability object handed to every extension event handler and transform. */
 export interface ExtensionContext {
@@ -162,7 +172,7 @@ export interface ExtensionDiffFile {
    * is what the renderer draws from. Carry it through untouched — spreading a
    * file (`{ ...file, path }`) preserves it. A file returned without usable
    * metadata is rejected, and the previous changeset is kept. On the read-only
-   * views Hunk hands outward (event payloads, sidebar props, a command's
+   * views Hunk hands outward (event payloads, pane props, a command's
    * selection) it is guarded like the rest of the view: reads pass through,
    * writes into it are refused.
    */
@@ -170,7 +180,7 @@ export interface ExtensionDiffFile {
   /**
    * How this file changed, using the same vocabulary VCS adapters report.
    *
-   * Present on the read-only views Hunk hands outward (event payloads, sidebar
+   * Present on the read-only views Hunk hands outward (event payloads, pane
    * props); a transform that synthesizes a file may omit it, and the file is
    * treated as an ordinary `"change"`.
    */
@@ -182,7 +192,7 @@ export interface ExtensionDiffFile {
    * order — empty for a file with nothing to select (binary, skipped).
    *
    * Like `changeType`, this is filled on the read-only views Hunk hands
-   * outward (event payloads, sidebar props, a command's selection). It is
+   * outward (event payloads, pane props, a command's selection). It is
    * derived from `metadata` at that boundary, so a transform neither receives
    * nor needs to produce it — a `hunks` value on a transform's returned file
    * is ignored in favor of what the metadata actually parses to.
@@ -230,6 +240,49 @@ export interface ExtensionKeyEvent {
   /** The alt/option modifier. */
   option?: boolean;
   shift?: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Session keyboard modes                                                      */
+/* -------------------------------------------------------------------------- */
+
+/** What a session keyboard mode did with one key. */
+export type ExtensionKeyboardModeKeyResult = "handled" | "pass" | "exit";
+
+/** Renderer-free capabilities available while a session keyboard mode runs. */
+export interface ExtensionKeyboardModeContext extends ExtensionContext {
+  /** Live access to explicitly public built-in Hunk commands. */
+  readonly commands: ExtensionCommandControls;
+  /** Invalidate prepared line highlights, e.g. after a prompt submit changes them. */
+  readonly highlights: ExtensionLineHighlightControls;
+  /**
+   * Controls scoped to this extension and activation.
+   *
+   * They become inert when the activation exits, so retained callbacks cannot inspect, stop, or
+   * replace a later mode. A deliberate replacement may be entered while `onKey` is running;
+   * ownership changes return `false` while `onEnter` or `onExit` is running.
+   */
+  readonly keyboardModes: ExtensionKeyboardModeControls;
+}
+
+/**
+ * One deliberately activated, session-scoped keyboard interpretation.
+ *
+ * Modes receive keys after host modal/focused surfaces and interactive file
+ * views, but before ordinary app commands. They are synchronous because their
+ * return value decides ownership of the current terminal key.
+ */
+export interface ExtensionKeyboardMode {
+  /** Identifies the mode within its extension; `<extensionId>:<id>` globally. */
+  id: string;
+  /** Human-readable label shown while the mode is active. */
+  title: string;
+  /** Decide whether to consume, pass, or consume-and-exit for one key. */
+  onKey(key: ExtensionKeyEvent, ctx: ExtensionKeyboardModeContext): ExtensionKeyboardModeKeyResult;
+  /** Runs once before the first key reaches the mode. Must return synchronously; cannot change ownership. */
+  onEnter?(ctx: ExtensionKeyboardModeContext): void;
+  /** Runs exactly once on every exit path. Must return synchronously; cannot change ownership. */
+  onExit?(ctx: ExtensionKeyboardModeContext): void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -350,31 +403,31 @@ export interface ExtensionFileViewModeContext extends ExtensionContext {
  * `fileViews.enterMode`, never on its own — during which keys reach `onKey`
  * before Hunk's command table. Modes are session-scoped: nothing persists.
  *
- * Only one mode is active at a time, app-wide, and the host guarantees a way
- * out: Escape always exits, and every exit path runs `onExit` exactly once.
+ * Only one file-view mode is active at a time. When it is the highest-priority
+ * input owner, Escape exits it; every exit path runs `onExit` exactly once.
  */
 export interface ExtensionFileViewMode {
   /**
    * Decide what happens to one key, synchronously.
    *
    * The return value *is* the routing decision, so it cannot be awaited:
-   * `"handled"` consumes the key, `"pass"` declines it (the key then flows on
-   * to the command table and scrolling exactly as if no mode were active), and
-   * `"exit"` consumes the key and leaves the mode. Start async work here and
+   * `"handled"` consumes the key, `"pass"` declines it (routing then continues
+   * through any active session keyboard mode, the command table, and focused
+   * scrolling), and `"exit"` consumes the key and leaves the mode. Start async work here and
    * report it afterwards through `ctx.notify` or `ctx.fileViews.refresh`.
    *
    * Every key the app's modal surfaces do not claim arrives — including plain
    * printable characters, which would otherwise run whatever command is bound
-   * to them. Escape is the one exception: it is host-owned and exits the mode
-   * without ever reaching this handler.
+   * to them. When this mode owns input, Escape is the one exception: it is
+   * host-owned and exits the mode without ever reaching this handler.
    *
    * A throw is contained: Hunk warns naming the extension, exits the mode, and
    * the review keeps working.
    */
   onKey(key: ExtensionKeyEvent, ctx: ExtensionFileViewModeContext): ExtensionFileViewModeKeyResult;
-  /** Runs once when the mode is entered, before any key reaches `onKey`. */
+  /** Runs once when the mode is entered, before any key reaches `onKey`. Must return synchronously. */
   onEnter?(ctx: ExtensionFileViewModeContext): void;
-  /** Runs on every exit — key result, Escape, host auto-exit, or a contained throw. */
+  /** Runs synchronously on every exit — key result, Escape, host auto-exit, or a contained throw. */
   onExit?(ctx: ExtensionFileViewModeContext): void;
 }
 
@@ -394,6 +447,107 @@ export interface ExtensionFileView {
    * `ctx.fileViews.enterMode(viewId)` to start it.
    */
   mode?: ExtensionFileViewMode;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Line highlights                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What one line-highlight mark means.
+ *
+ * Tones rather than colors on purpose: a background is only visible resolved
+ * against the background it sits on, which differs per line kind (added,
+ * removed, context) and per theme. The host owns that resolution, applying the
+ * same minimum-contrast guarantee its own word-diff emphasis uses, so a mark
+ * is never invisible on a green line. A transparent cell has no color to blend
+ * against, so the host resolves the tint against the background it assumes the
+ * terminal shows. `"current"` is the emphatic variant of `"match"` — search
+ * uses it for the match the user is on. `"dim"` recedes the text toward its
+ * background while preserving token hues.
+ */
+export type ExtensionLineHighlightTone = "match" | "current" | "info" | "warning" | "error" | "dim";
+
+/**
+ * One marked character range inside one diff line.
+ *
+ * Addressed by source coordinates — `(side, line, range)` — rather than by
+ * rendered rows, so a mark survives split vs stack layout, line wrapping,
+ * horizontal scrolling, and collapsed-context expansion without the extension
+ * ever learning Hunk's row model.
+ */
+export interface ExtensionLineHighlight {
+  /** Which side the line belongs to. A context line may be addressed by either side. */
+  side: ExtensionFileSide;
+  /** 1-based source line number on that side. */
+  line: number;
+  /**
+   * `[start, end)` UTF-16 code-unit offsets into the line's raw source text —
+   * the text as it appears in `ExtensionDiffFile.patch` or a `readDocument`
+   * result, before Hunk's tab expansion or terminal sanitization. This is what
+   * `String.prototype.indexOf` and `RegExp.exec` return, so scanning the patch
+   * yields usable offsets directly. The host maps them to terminal columns and
+   * widens them to grapheme-cluster boundaries, so an offset inside an emoji or
+   * a CJK character marks the whole visible glyph rather than tearing it.
+   *
+   * Marks paint terminal columns, so a range covering only characters that
+   * occupy none — bidi controls, zero-width spaces and joiners — paints
+   * nothing.
+   */
+  range: readonly [number, number];
+  /** What the mark means. Defaults to `"match"`. */
+  tone?: ExtensionLineHighlightTone;
+}
+
+/** The input one line-highlight request receives. */
+export interface ExtensionLineHighlightInput {
+  readonly file: ExtensionDiffFile;
+  /** Aborted when the result can no longer be used (reload, supersession, timeout). */
+  readonly signal: AbortSignal;
+  /**
+   * Read one side's complete source document, exactly like
+   * `ExtensionFileViewInput.readDocument`. Resolves `null` whenever the side
+   * cannot be read. Patch text is already at hand as `file.patch`.
+   */
+  readDocument(side: ExtensionFileSide): Promise<string | null>;
+}
+
+/**
+ * A contributor of character-range marks painted onto diff lines.
+ *
+ * `highlight` is a pure derivation of the file plus an invalidation epoch: the
+ * host calls it per reviewed file, caches the result, and re-calls it only
+ * when `ctx.highlights.refresh` bumps the epoch or the review reloads. There
+ * is no host-held mark state to go stale. Highlights are paint-only — they
+ * change colors, never text or geometry — so the failure mode of a throwing,
+ * rejecting, or timed-out `highlight` is "no marks for that file" and nothing
+ * else.
+ *
+ * Marks whose lines never render (a line inside a collapsed gap, a line the
+ * patch does not contain) are silently invisible rather than errors: the mark
+ * is valid, the review just is not showing that line.
+ */
+export interface ExtensionLineHighlighter {
+  /** Identifies the highlighter within its extension; `<extensionId>:<id>` globally. */
+  id: string;
+  /** Return every mark for one file, or `null`/empty for none. */
+  highlight(
+    input: ExtensionLineHighlightInput,
+  ): readonly ExtensionLineHighlight[] | null | Promise<readonly ExtensionLineHighlight[] | null>;
+}
+
+/** Invalidate prepared line highlights from a command or keyboard-mode handler. */
+export interface ExtensionLineHighlightControls {
+  /**
+   * Mark this highlighter's prepared results stale so `highlight` runs again.
+   *
+   * Without `fileId` every file's marks for this highlighter are re-derived;
+   * with one, only that file's. A `fileId` no reviewed file carries
+   * invalidates nothing and warns about nothing: ids can race a reload. Bare
+   * ids address the calling extension's own highlighter,
+   * `"<extensionId>:<highlighterId>"` addresses any registered one.
+   */
+  refresh(highlighterId: string, options?: { fileId?: string }): void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -484,14 +638,16 @@ export type ExtensionThemeConfig = NamedCustomThemeConfig;
 /* -------------------------------------------------------------------------- */
 
 /**
- * Detection priority of Hunk's Git backend.
+ * Baseline detection priority used by Hunk's default bundled backend.
  *
- * Adapters are consulted highest priority first, so this is the baseline every
- * other backend positions itself around. Hunk's bundled Jujutsu and Sapling
- * backends deliberately register above it: a colocated jj or Sapling checkout
- * also contains a `.git` directory, and must not be reviewed as plain Git.
+ * Adapters are consulted highest priority first. Bundled providers that must
+ * win a same-root tie register above this value; user adapters can do the same
+ * when their repository metadata establishes the authoritative working copy.
  */
-export const HUNK_CORE_VCS_DETECTION_PRIORITY = 0;
+export const HUNK_VCS_DETECTION_BASELINE_PRIORITY = 0;
+
+/** @deprecated Use `HUNK_VCS_DETECTION_BASELINE_PRIORITY`. */
+export const HUNK_CORE_VCS_DETECTION_PRIORITY = HUNK_VCS_DETECTION_BASELINE_PRIORITY;
 
 /**
  * Detection priority an adapter gets when it does not choose one.
@@ -511,7 +667,6 @@ export interface ExtensionVcsDetection {
 /** Ambient information an operation may need to shell out. */
 export interface ExtensionVcsLoadContext {
   cwd: string;
-  gitExecutable?: string;
 }
 
 /**
@@ -535,14 +690,34 @@ export interface ExtensionVcsReviewOptions {
   colorMoved?: boolean;
 }
 
-/** Working-tree review request, as extension adapters receive it. */
-export interface ExtensionVcsDiffInput {
-  kind: "vcs";
-  range?: string;
-  staged: boolean;
-  pathspecs?: string[];
-  options: ExtensionVcsReviewOptions;
+/** The two revisions named by `hunk diff <from> <to>`, kept backend-neutral. */
+export interface ExtensionVcsRangeEndpoints {
+  /** Revision supplying the old side of the comparison. */
+  from: string;
+  /** Revision supplying the new side of the comparison. */
+  to: string;
 }
+
+/** Working-tree review request, as extension adapters receive it. */
+export type ExtensionVcsDiffInput =
+  | {
+      kind: "vcs";
+      /** One revision or range expression in the selected backend's language. */
+      range?: string;
+      rangeEndpoints?: never;
+      staged: boolean;
+      pathspecs?: string[];
+      options: ExtensionVcsReviewOptions;
+    }
+  | {
+      kind: "vcs";
+      range?: never;
+      /** Two explicit revisions, kept separate so each backend can spell the comparison correctly. */
+      rangeEndpoints: ExtensionVcsRangeEndpoints;
+      staged: boolean;
+      pathspecs?: string[];
+      options: ExtensionVcsReviewOptions;
+    };
 
 /** Single-revision review request, as extension adapters receive it. */
 export interface ExtensionVcsShowInput {
@@ -598,7 +773,9 @@ export interface ExtensionVcsFileSourceRequest {
  * what lets Hunk expand context beyond the hunk, highlight against the real
  * file, and word-diff accurately. Return `null` when the side has no content —
  * a missing path, or the absent side of an added or deleted file — rather than
- * throwing.
+ * throwing. Return `{ kind: "too-large", maxBytes }` when reading the source
+ * would exceed the adapter's safety limit; Hunk presents that as an unavailable
+ * expansion without treating it as an extension failure.
  *
  * Hunk calls this at most once per file and side and caches what it resolves,
  * so the reader does not need its own cache. It is never called for a file the
@@ -606,9 +783,19 @@ export interface ExtensionVcsFileSourceRequest {
  * operation is loading and close over them: the request describes the file, not
  * the commits, because only the adapter knows how to name them.
  */
+/** A source side the adapter declined to read because it exceeded its safety limit. */
+export interface ExtensionVcsFileSourceTooLarge {
+  kind: "too-large";
+  /** The byte ceiling the source exceeded, when useful to diagnostics. */
+  maxBytes?: number;
+}
+
+/** One exact-source read result returned through the public adapter boundary. */
+export type ExtensionVcsFileSourceResult = string | null | ExtensionVcsFileSourceTooLarge;
+
 export type ExtensionVcsFileSourceReader = (
   request: ExtensionVcsFileSourceRequest,
-) => Promise<string | null>;
+) => Promise<ExtensionVcsFileSourceResult>;
 
 /* -------------------------------------------------------------------------- */
 /* Extra reviewed files                                                        */
@@ -798,7 +985,7 @@ export interface ExtensionVcsAdapter {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Sidebar views                                                               */
+/* Docked panes                                                                */
 /* -------------------------------------------------------------------------- */
 
 /**
@@ -833,8 +1020,10 @@ export interface ExtensionPaintTheme {
   noteBorder: string;
 }
 
-/** Backward-compatible name for the shared extension painter theme. */
-export type ExtensionSidebarTheme = ExtensionPaintTheme;
+/** Theme exposed to extension-owned pane painters. */
+export type ExtensionPaneTheme = ExtensionPaintTheme;
+/** @deprecated Use ExtensionPaneTheme. */
+export type ExtensionSidebarTheme = ExtensionPaneTheme;
 
 /**
  * Navigation any extension surface can trigger, exactly as the built-in
@@ -854,28 +1043,46 @@ export interface ExtensionReviewNavigation {
   selectFile(fileId: string): void;
   /** Jump the review stream to one hunk of one file. */
   selectHunk(fileId: string, hunkIndex: number): void;
+  /**
+   * Jump the review stream to one source line, addressed by side and number.
+   *
+   * The finest navigation target there is: a hunk hundreds of lines tall no
+   * longer lands the viewport pages away from the line you meant. `line` is a
+   * 1-based number on `side` as the patch numbers it, so a context line
+   * answers to either side's number. The revealed line lands where every other
+   * Hunk reveal lands — a little below the viewport top — and becomes the
+   * current line, so it pairs with a mark from `registerLineHighlighter`.
+   *
+   * When the review cannot render that line (it sits inside a collapsed gap,
+   * or the patch never numbered it) the jump falls back to the hunk containing
+   * it; a line no hunk contains is refused with a warning naming the
+   * extension.
+   */
+  revealLine(fileId: string, side: "old" | "new", line: number): void;
 }
 
 /**
- * What a custom sidebar component can trigger: review navigation plus a toast.
+ * What a custom pane component can trigger: review navigation plus a toast.
  *
  * Actions stay valid for as long as the component is mounted.
  */
-export interface ExtensionSidebarActions extends ExtensionReviewNavigation {
+export interface ExtensionPaneActions extends ExtensionReviewNavigation {
   /** Show one toast, attributed to the owning extension. */
   notify(message: string, type?: ExtensionNotifyType): void;
 }
+/** @deprecated Use ExtensionPaneActions. */
+export type ExtensionSidebarActions = ExtensionPaneActions;
 
 /**
- * The resolved command bindings available to a custom sidebar.
+ * The resolved command bindings available to a custom pane.
  *
- * This mirrors Pi's injected keybindings manager: sidebar components name a
+ * This mirrors Pi's injected keybindings manager: pane components name a
  * command instead of repeating its default chord, so their local key handling
  * follows the user's `[keybindings]` configuration. The command ids are the
  * same ids documented by Hunk (`"hunk.review.nextFile"`) and extensions
  * (`"<extensionId>.<commandId>"`).
  */
-export interface ExtensionSidebarKeybindings {
+export interface ExtensionPaneKeybindings {
   /** Report whether one terminal key event matches the command's current binding. */
   matches(
     key: {
@@ -892,64 +1099,146 @@ export interface ExtensionSidebarKeybindings {
   getKeys(commandId: string): readonly string[];
 }
 
-/** Everything a custom sidebar component receives, refreshed as the app changes. */
-export interface ExtensionSidebarViewProps {
+/** A terminal edge where a host-owned pane can be docked. */
+export type ExtensionPanePlacement = "left" | "right" | "top" | "bottom";
+
+/** Requested pane width or height along its docked edge. */
+export interface ExtensionPaneSize {
+  /** Fixed-cell target when `fraction` is omitted, and a fallback for pre-v12 hosts. */
+  preferred: number;
+  min?: number;
+  max?: number;
   /**
-   * The reviewed files currently visible, in review-stream order.
+   * Responsive target as a fraction of the host body width or height.
    *
-   * Read-only frozen views, filtered the way the built-in sidebar is: the
-   * app's file filter applies before the list reaches the component.
+   * Without a session-local drag override, Hunk rounds the full body-axis
+   * fraction to a terminal cell. It then applies `min`, `max`, and the space
+   * required by the review to the chosen automatic or manual target.
    */
-  files: ExtensionDiffFile[];
-  selectedFileId: string | null;
-  selectedHunkIndex: number | null;
-  /** Terminal columns the sidebar pane occupies; height comes from flex layout. */
-  width: number;
-  theme: ExtensionSidebarTheme;
-  /** Resolved command bindings; use these instead of hard-coding sidebar chords. */
-  keybindings: ExtensionSidebarKeybindings;
-  actions: ExtensionSidebarActions;
+  fraction?: number;
 }
 
 /**
- * A custom sidebar component.
+ * Host renderer for the selected split row, plus the source address that row
+ * occupies.
  *
- * This is a plain React function component rendered inside Hunk's own tree —
- * import `react` normally (Hunk serves its own instance to extension files, so
- * hooks work; never bundle a copy of React into an extension) and return
- * OpenTUI elements (`box`, `text`, `scrollbox`, ...). The return type is
- * opaque here only because this module publishes no React types; annotate the
- * component with your own `@types/react` and it satisfies this shape.
+ * `render` is still the only way to paint the row: it does not publish Pierre
+ * rows, plans, or cursor keys. `side` and `line` are the same public address
+ * command handlers already see on `ctx.selection.currentLine`, so a pane can
+ * look up blame, diagnostics, or notes without waiting for a keypress.
  */
-export type ExtensionSidebarComponent = (props: ExtensionSidebarViewProps) => unknown;
+export interface ExtensionCurrentLinePaint {
+  /**
+   * Which side the current-line marker addresses.
+   *
+   * Context rows use Hunk's canonical new-side address, matching
+   * `ctx.selection.currentLine` and `navigation.revealLine`.
+   */
+  readonly side: ExtensionFileSide;
+  /** 1-based source line number on `side`. */
+  readonly line: number;
+  /** Paint one side as a clipped, no-wrap terminal row. */
+  render(side: "old" | "new", width: number): unknown;
+}
 
-/** Which side of the review stream a sidebar pane sits on. */
-export type ExtensionSidebarPlacement = "left" | "right";
+/** Immutable state used to decide whether an open pane is meaningful this frame. */
+export interface ExtensionPaneAvailabilityContext {
+  readonly placement: ExtensionPanePlacement;
+  readonly files: readonly ExtensionDiffFile[];
+  readonly selectedFileId: string | null;
+  readonly selectedHunkIndex: number | null;
+  readonly currentLine: ExtensionCurrentLinePaint | null;
+}
 
-/**
- * A sidebar view contributed by an extension.
- *
- * Registration is additive: every registered view exists alongside the
- * built-in file navigation, and any number can be open at once. A view opens
- * when `defaultOpen` asks for it, or when extension code opens it through the
- * sidebar controls — typically from a `registerCommand` handler bound to a
- * key.
- */
-export interface ExtensionSidebarView {
-  /** Identifies the view within its extension; `<extensionId>:<id>` globally. */
+/** Everything a custom pane component receives, refreshed as the app changes. */
+export interface ExtensionPaneProps {
+  readonly files: readonly ExtensionDiffFile[];
+  readonly selectedFileId: string | null;
+  readonly selectedHunkIndex: number | null;
+  readonly placement: ExtensionPanePlacement;
+  /** Exact host-owned component rectangle. */
+  readonly width: number;
+  readonly height: number;
+  readonly theme: ExtensionPaneTheme;
+  readonly keybindings: ExtensionPaneKeybindings;
+  readonly actions: ExtensionPaneActions;
+  /**
+   * Selected-row painter plus `{ side, line }` when the registration opted in
+   * with `currentLine: true`; otherwise `null`.
+   */
+  readonly currentLine: ExtensionCurrentLinePaint | null;
+}
+
+/** A React/OpenTUI component mounted inside an exact host-owned rectangle. */
+export type ExtensionPaneComponent = (props: ExtensionPaneProps) => unknown;
+
+/** Fields shared by panes on every terminal edge. */
+interface ExtensionPaneBase {
+  /** Identifies the pane within its extension; `<extensionId>:<id>` globally. */
   id: string;
-  /** Human-readable name, for diagnostics and future menu listings. */
   title?: string;
-  /** Which side of the review stream the pane sits on. Defaults to `"left"`. */
-  placement?: ExtensionSidebarPlacement;
-  /** Open this view when the session starts. Defaults to closed. */
   defaultOpen?: boolean;
   /**
-   * Stand in for the built-in file navigation instead of joining it.
+   * Start open in place of this pane, which starts closed.
    *
-   * Implies `defaultOpen`: the view starts open and the built-in `files`
-   * sidebar starts closed (the user or an extension can still reopen it).
+   * Use `"hunk:files"` for the files role or a fully qualified
+   * `"<extensionId>:<paneId>"` key to extend a replacement chain. Hunk's
+   * files-pane command follows the resolved owner on any terminal edge.
+   * Replacement initial defaults take precedence over `defaultOpen`. The first
+   * pane registered for a named target owns its slot; later claims are skipped.
    */
+  replaces?: string;
+  /** Opt into live current-line paint and `{ side, line }`; unrelated panes receive stable null. */
+  currentLine?: boolean;
+  /** Synchronous frame-availability policy. */
+  available?(context: ExtensionPaneAvailabilityContext): boolean;
+  /** Observes primary mouse presses inside the pane without consuming child interaction. */
+  onActivate?(): void;
+  component: ExtensionPaneComponent;
+}
+
+/** A left/right pane sized in terminal columns, optionally with a responsive target. */
+export interface ExtensionVerticalPane extends ExtensionPaneBase {
+  /** Defaults to `"left"`. */
+  placement?: "left" | "right";
+  /** Defaults to 34 preferred and 22 minimum columns. */
+  width?: ExtensionPaneSize;
+  height?: never;
+}
+
+/** A top/bottom pane sized in terminal rows, optionally with a responsive target. */
+export interface ExtensionHorizontalPane extends ExtensionPaneBase {
+  placement: "top" | "bottom";
+  /** Defaults to 8 preferred and 3 minimum rows. */
+  height?: ExtensionPaneSize;
+  width?: never;
+}
+
+/** A docked pane contributed by an extension. */
+export type ExtensionPane = ExtensionVerticalPane | ExtensionHorizontalPane;
+
+/** @deprecated Use ExtensionPaneKeybindings. */
+export type ExtensionSidebarKeybindings = ExtensionPaneKeybindings;
+/** @deprecated Use ExtensionPanePlacement. */
+export type ExtensionSidebarPlacement = Extract<ExtensionPanePlacement, "left" | "right">;
+/** @deprecated Use ExtensionPaneProps. */
+export interface ExtensionSidebarViewProps {
+  files: ExtensionDiffFile[];
+  selectedFileId: string | null;
+  selectedHunkIndex: number | null;
+  width: number;
+  theme: ExtensionSidebarTheme;
+  keybindings: ExtensionSidebarKeybindings;
+  actions: ExtensionSidebarActions;
+}
+/** @deprecated Use ExtensionPaneComponent. */
+export type ExtensionSidebarComponent = (props: ExtensionSidebarViewProps) => unknown;
+/** @deprecated Use ExtensionPane. */
+export interface ExtensionSidebarView {
+  id: string;
+  title?: string;
+  placement?: ExtensionSidebarPlacement;
+  defaultOpen?: boolean;
   replacesDefault?: boolean;
   component: ExtensionSidebarComponent;
 }
@@ -957,6 +1246,52 @@ export interface ExtensionSidebarView {
 /* -------------------------------------------------------------------------- */
 /* Commands                                                                    */
 /* -------------------------------------------------------------------------- */
+
+/** One top-level CLI command subtree contributed by an extension. */
+export interface ExtensionCliCommand {
+  /** Globally claimed lowercase-kebab token, such as `greptile` or `pr`. */
+  name: string;
+  /** Human-readable description for command discovery surfaces. */
+  summary: string;
+  /** Optional usage suffix, excluding `hunk <name>`. */
+  usage?: string;
+}
+
+/** A leased, backpressure-aware CLI output capability. */
+export interface ExtensionCliWriter {
+  /** Write one chunk; rejects after the command handler settles. */
+  write(chunk: string | Uint8Array): Promise<void>;
+}
+
+/** Headless host capabilities granted to the active CLI command handler. */
+export interface ExtensionCliCommandContext {
+  readonly cwd: string;
+  readonly signal: AbortSignal;
+  readonly stdin: AsyncIterable<Uint8Array>;
+  readonly stdout: ExtensionCliWriter;
+  readonly stderr: ExtensionCliWriter;
+}
+
+/** Finish the Hunk process with a validated exit status. */
+export interface ExtensionCliExitResult {
+  readonly kind: "exit";
+  /** Defaults to zero; must be a safe integer from 0 through 255. */
+  readonly code?: number;
+}
+
+/** Hand terminal ownership to one built-in Hunk command. */
+export interface ExtensionCliDelegateResult {
+  readonly kind: "delegate";
+  /** Tokens after the `hunk` executable. Extension commands cannot be targets. */
+  readonly argv: readonly string[];
+}
+
+export type ExtensionCliCommandResult = ExtensionCliExitResult | ExtensionCliDelegateResult;
+
+export type ExtensionCliCommandHandler = (
+  args: readonly string[],
+  ctx: ExtensionCliCommandContext,
+) => ExtensionCliCommandResult | Promise<ExtensionCliCommandResult>;
 
 /**
  * One named keyboard command contributed by an extension.
@@ -1007,7 +1342,10 @@ export interface ExtensionCommandExecutionOptions {
   count?: number;
 }
 
-/** Inspect and invoke the public semantic commands owned by Hunk. */
+/**
+ * Inspect and invoke the public commands owned by Hunk.
+ * Canonical ids and documented compatibility aliases resolve to the same command.
+ */
 export interface ExtensionCommandControls {
   /** Report whether one public `hunk.*` command exists and can run right now; malformed ids return false. */
   isEnabled(commandId: string): boolean;
@@ -1020,21 +1358,38 @@ export interface ExtensionCommandControls {
   execute(commandId: string, options?: ExtensionCommandExecutionOptions): boolean;
 }
 
-/** Open, close, and inspect sidebar views from a command handler. */
-export interface ExtensionSidebarControls {
+/**
+ * Enter, leave, and inspect this extension's registered session keyboard modes.
+ * Ownership-changing calls return `false` during `onEnter` and `onExit`.
+ */
+export interface ExtensionKeyboardModeControls {
+  /** Enter one owned mode from a command or `onKey`, replacing the active session mode. */
+  enterMode(modeId: string): boolean;
+  /** Leave this extension's active mode from a command or `onKey`. */
+  exitMode(): boolean;
+  /** Report whether this extension owns the active mode, optionally requiring one local id. */
+  isActive(modeId?: string): boolean;
+}
+
+/** Open, close, and inspect panes from a command handler. */
+export interface ExtensionPaneControls {
   /**
-   * Resolve one view: a bare id names this extension's own view, `"files"`
-   * names the built-in file navigation, and `"<extensionId>:<viewId>"`
-   * addresses any registered view explicitly.
+   * Resolve one pane: a bare id names this extension's own pane, while a fully
+   * qualified `"<extensionId>:<paneId>"` key addresses any registered pane.
+   * Use `"hunk:files"` for the literal built-in pane. These controls do not
+   * resolve replacement slots; execute `hunk.view.toggleFilesPane` through
+   * command controls for the active files role.
    *
-   * Opening a view (here, or via `toggle`) also reveals the sidebar area when
-   * the user has hidden it, so the open is never silent.
+   * Opening a left/right pane (here, or via `toggle`) also reveals the sidebar
+   * area when it is hidden, so the open is never silent.
    */
   open(viewId: string): void;
   close(viewId: string): void;
   toggle(viewId: string): void;
   isOpen(viewId: string): boolean;
 }
+/** @deprecated Use ExtensionPaneControls. */
+export type ExtensionSidebarControls = ExtensionPaneControls;
 
 /** Select or inspect the active file presentation from an extension command. */
 export interface ExtensionFileViewControls {
@@ -1091,8 +1446,9 @@ export interface ExtensionFileViewControls {
    * resolves, and a layout that declines or fails falls back to raw diff.
    *
    * While the mode is active, keys the app's modal surfaces do not claim reach
-   * `onKey` before Hunk's command table. Escape is host-owned: it exits the
-   * mode and never reaches the handler, so there is always a way out.
+   * `onKey` before Hunk's command table. When the mode is the highest-priority
+   * input owner, Escape is host-owned: it exits the mode and never reaches the
+   * handler, so there is always a way out.
    *
    * Hunk also exits the mode by itself when the review moves out from under it
    * — the selected file changes, the view stops being that file's presentation
@@ -1109,8 +1465,8 @@ export interface ExtensionFileViewControls {
   /**
    * Leave the active mode, whichever view owns it.
    *
-   * Global rather than per-view, because only one mode is active at a time,
-   * and idempotent: calling it with no mode active does nothing.
+   * Global across file views because only one file-view mode is active at a
+   * time, and idempotent: calling it with no file-view mode active does nothing.
    */
   exitMode(): void;
   /** Report whether this view's mode is the one currently active. */
@@ -1127,12 +1483,10 @@ export interface ExtensionReviewSelection {
   /**
    * The selected file among the currently visible (filtered) files, or `null`.
    *
-   * The same frozen read-only view a sidebar component receives in its `files`
-   * prop, so holding or mutating it cannot reach the review model. Hunk keeps
-   * the selection inside the visible list — filtering away the selected file
-   * immediately reselects the first visible one — so in practice this is
-   * `null` only when nothing is visible at all, such as a filter matching no
-   * files.
+   * The same frozen read-only view a pane component receives in its `files`
+   * prop, so holding or mutating it cannot reach the review model. Extensions
+   * only receive visible files, so this is `null` when filtering hides the
+   * selected file or when no files are visible.
    */
   readonly file: ExtensionDiffFile | null;
   /**
@@ -1141,6 +1495,106 @@ export interface ExtensionReviewSelection {
    * hunks to select (a binary or skipped file).
    */
   readonly hunkIndex: number | null;
+  /**
+   * The source line carrying Hunk's current-line marker, or `null` when line
+   * navigation is off or the review has not settled on a rendered line yet.
+   *
+   * `line` is one-based on `side`, matching patch line numbers and
+   * `navigation.revealLine`. Context rows use Hunk's canonical new-side
+   * address. This copied, frozen target belongs to `file` and `hunkIndex` in
+   * this same snapshot; it never exposes renderer cursor state.
+   */
+  readonly currentLine: {
+    readonly side: ExtensionFileSide;
+    readonly line: number;
+  } | null;
+}
+
+/** One stable reviewed file in an authoritative extension snapshot. */
+export interface ExtensionReviewSnapshotFile {
+  /** Stable semantic address within this review, independent of renderer ids and indexes. */
+  readonly fileKey: string;
+  /** Transitional renderer id for navigation inside this exact generation. */
+  readonly runtimeId: string;
+  readonly path: string;
+  readonly previousPath?: string;
+  readonly changeKind: "change" | "rename-pure" | "rename-changed" | "new" | "deleted";
+  readonly stats: {
+    readonly additions: number;
+    readonly deletions: number;
+    readonly truncated: boolean;
+  };
+  readonly flags: {
+    readonly untracked: boolean;
+    readonly binary: boolean;
+    readonly tooLarge: boolean;
+    readonly partial: boolean;
+  };
+  /** Digest of the file's renderer-neutral review content. */
+  readonly contentIdentity: string;
+  readonly sourceIdentity?: string;
+  readonly sourceAttested?: boolean;
+}
+
+/** The one source line a saved review-note anchor prefers. */
+export interface ExtensionReviewSnapshotLineAddress {
+  readonly side: ExtensionFileSide;
+  readonly line: number;
+}
+
+/** Complete semantic anchor retained for one saved review note. */
+export interface ExtensionReviewSnapshotNoteAnchor {
+  readonly oldRange?: readonly [number, number];
+  readonly newRange?: readonly [number, number];
+  readonly preferred?: ExtensionReviewSnapshotLineAddress;
+  readonly intersectingHunkIndices: readonly number[];
+  readonly ownerHunkIndex?: number;
+}
+
+/** One complete saved note in an authoritative extension review snapshot. */
+export interface ExtensionReviewSnapshotNote {
+  readonly id: string;
+  readonly parentId?: string;
+  readonly source: "ai" | "agent" | "user";
+  readonly originalSource?: string;
+  readonly fileKey: string;
+  readonly anchor: ExtensionReviewSnapshotNoteAnchor;
+  readonly summary: string;
+  readonly rationale?: string;
+  readonly markup?: string;
+  readonly title?: string;
+  readonly author?: string;
+  readonly createdAt?: string;
+  readonly updatedAt?: string;
+  readonly editable: boolean;
+  readonly tags?: readonly string[];
+  readonly confidence?: "low" | "medium" | "high";
+  /** Reconciliation verdict against the snapshot's current document. */
+  readonly resolution: "active" | "stale" | "orphaned";
+}
+
+/** Immutable projection of the authoritative review state at one instant. */
+export interface ExtensionReviewSnapshot {
+  /** Opaque producer generation; state revisions compare only within this generation. */
+  readonly generation: string;
+  /** ReviewStore revision captured with the rest of this snapshot. */
+  readonly stateRevision: number;
+  /** Every reviewed file in authoritative review/sidebar order, regardless of filtering. */
+  readonly files: readonly ExtensionReviewSnapshotFile[];
+  /**
+   * Every note saved in ReviewStore: live-note arrival order, then reviewer-note creation order.
+   * Drafts and static sidecar annotations that never entered the store are excluded.
+   */
+  readonly notes: readonly ExtensionReviewSnapshotNote[];
+}
+
+/** Read the authoritative review while one extension command retains authority. */
+export interface ExtensionReviewControls {
+  /**
+   * Capture the current immutable review state, or return null after a reload or host teardown.
+   * Call again before irreversible asynchronous work and compare generation plus stateRevision.
+   */
+  snapshot(): ExtensionReviewSnapshot | null;
 }
 
 /** One question put to the user as a modal confirm dialog. */
@@ -1172,12 +1626,12 @@ export interface ExtensionInputOptions {
 /**
  * Ask the user questions from a command handler, one modal at a time.
  *
- * Every dialog is drawn by Hunk, not by the extension, and carries an
- * attribution line naming the extension that raised it — a prompt cannot
- * present itself as Hunk asking. Only one dialog is on screen at a time:
+ * Every dialog is drawn by Hunk, not by the extension. Dialogs from installed
+ * extensions carry an attribution line naming their source, so a third-party
+ * prompt cannot present itself as Hunk asking; Hunk-owned bundled extensions
+ * omit that redundant marker. Only one dialog is on screen at a time:
  * concurrent requests queue in call order (FIFO), including across extensions,
- * so a second question waits for the first to be answered rather than
- * replacing it.
+ * so a second question waits for the first to be answered rather than replacing it.
  *
  * Escape always cancels, resolving the cancel value (`false`, or `null`).
  * Enter accepts: the confirm action, the highlighted option, or the typed text.
@@ -1315,9 +1769,13 @@ export interface ExtensionWorkspace {
    * On success Hunk reloads the session the same way the refresh key does, so
    * the review an extension sees afterwards reflects what it wrote. That holds
    * for every write that can happen: a session whose review could not be
-   * rebuilt refuses writes rather than accepting one it would then hide. The
-   * returned promise settles on the write itself, not on the reload — a handler
-   * that resumes immediately is looking at the changeset it was called with.
+   * rebuilt refuses writes rather than accepting one it would then hide.
+   * Authority is checked immediately before the filesystem call; once that
+   * irreversible write starts, the promise reports its actual outcome even if
+   * another reload wins meanwhile, and success reconciles the review then active.
+   * Graceful shutdown waits for a started write to settle. The promise settles
+   * on the write itself, not on its follow-up reload — a handler that
+   * resumes immediately is looking at the changeset it was called with.
    *
    * A filesystem that refuses the write resolves `"failed"` with a
    * human-readable `detail`. The promise **rejects** only for a malformed
@@ -1328,13 +1786,34 @@ export interface ExtensionWorkspace {
   writeDocument(request: ExtensionWorkspaceWriteRequest): Promise<ExtensionWorkspaceWriteResult>;
 }
 
+/** Host-level behavior one extension may request for the current review session. */
+export interface ExtensionSessionOptions {
+  /**
+   * Treat view-setting changes as temporary practice or presentation state.
+   *
+   * When `"transient"`, Hunk never offers to write the session's final view
+   * settings into the user's config on quit. Any extension requesting
+   * transient behavior makes the shared session transient.
+   */
+  viewPreferences?: "default" | "transient";
+}
+
 /** What a command handler receives when its key fires. */
 export interface ExtensionCommandContext extends ExtensionContext {
   /** Live access to the public built-in command table. */
   readonly commands: ExtensionCommandControls;
-  sidebars: ExtensionSidebarControls;
+  /** Session keyboard modes registered by this command's owning extension. */
+  readonly keyboardModes: ExtensionKeyboardModeControls;
+  /** Session panes registered by this command's owning extension. */
+  readonly panes: ExtensionPaneControls;
+  /** Invalidate prepared line highlights so `highlight` re-derives them. */
+  readonly highlights: ExtensionLineHighlightControls;
+  /** @deprecated Use panes. */
+  readonly sidebars: ExtensionSidebarControls;
   /** Host-owned selection controls for alternate file presentations. */
   fileViews: ExtensionFileViewControls;
+  /** Capture complete saved review state from the shared ReviewStore. */
+  readonly review: ExtensionReviewControls;
   /**
    * Where the review was pointing when this command fired.
    *
@@ -1343,7 +1822,7 @@ export interface ExtensionCommandContext extends ExtensionContext {
    */
   readonly selection: ExtensionReviewSelection;
   /**
-   * Navigate the review stream, exactly as a sidebar's actions do.
+   * Navigate the review stream, exactly as a pane's actions do.
    *
    * Live rather than snapshot, the opposite of `selection`: a call acts on the
    * review as it is at that moment, validated against the currently visible
@@ -1354,8 +1833,9 @@ export interface ExtensionCommandContext extends ExtensionContext {
   /**
    * Ask the user a question and await the answer.
    *
-   * Valid for the whole life of the handler's promise, so a handler may open
-   * several dialogs in sequence with work in between.
+   * Valid for the handler's promise while this review generation remains
+   * current, so a handler may open several dialogs in sequence with work in
+   * between. A reload expires retained controls and returns cancel values.
    */
   readonly dialogs: ExtensionDialogs;
   /**
@@ -1363,7 +1843,10 @@ export interface ExtensionCommandContext extends ExtensionContext {
    * user's consent.
    *
    * Host-mediated on purpose: the file is named by review id, a write asks the
-   * user first, and the review reloads after a successful write.
+   * user first, and the review reloads after a successful write. Retained reads
+   * and writes that have not started expire with this review generation
+   * (`null`/`"unavailable"`); an irreversible write already in progress reports
+   * its real filesystem outcome.
    */
   readonly workspace: ExtensionWorkspace;
 }
@@ -1391,9 +1874,15 @@ export interface ExtensionEventBus {
   emit<Payload = unknown>(event: string, payload: Payload): void;
 }
 
-/** Context lifecycle and bus listeners receive, including live sidebar controls. */
+/** Context lifecycle and bus listeners receive, with controls scoped to this review generation. */
 export interface ExtensionEventContext extends ExtensionContext {
+  panes: ExtensionPaneControls;
+  /** @deprecated Use panes. */
   sidebars: ExtensionSidebarControls;
+  /** Navigate the live review from lifecycle-driven guides and coordinators. */
+  readonly navigation: ExtensionReviewNavigation;
+  /** Ask attributed, FIFO-queued questions from lifecycle and bus handlers. */
+  readonly dialogs: ExtensionDialogs;
   events: Pick<ExtensionEventBus, "emit">;
 }
 
@@ -1417,6 +1906,8 @@ export type ExtensionResolvedLayout = Exclude<ExtensionLayoutMode, "auto">;
 /** A user-authored note as reported by note lifecycle events. */
 export interface ExtensionReviewNote {
   id: string;
+  /** Direct parent identity for a saved reply or reply draft. */
+  parentId?: string;
   fileId: string;
   filePath: string;
   hunkIndex: number;
@@ -1427,12 +1918,24 @@ export interface ExtensionReviewNote {
   draft: boolean;
 }
 
+/** How one saved ReviewStore note changed, as reported by `note_changed`. */
+export type ExtensionNoteChangeKind = "created" | "updated" | "removed";
+
 export interface ExtensionEventPayloads {
   startup: { cwd: string };
   changeset_loaded: { changeset: ExtensionChangeset };
+  /** A named built-in or extension command was dispatched in this terminal host. */
+  command_executed: { commandId: string };
   selection_changed: { fileId: string | null; hunkIndex: number | null };
   /** The review stream settled on a different file. */
   file_viewed: { file: ExtensionDiffFile; hunkIndex: number | null };
+  /**
+   * The review stream settled on a different hunk.
+   *
+   * Fires for `[`/`]` within a file as well as a jump to another file's hunk.
+   * Current-line movement inside the same hunk does not emit this event.
+   */
+  hunk_viewed: { file: ExtensionDiffFile; hunkIndex: number };
   /** The file-filter query changed, including when it was cleared. */
   filter_changed: { filter: string };
   /** The user committed a different active theme. Selector previews do not emit this event. */
@@ -1443,8 +1946,16 @@ export interface ExtensionEventPayloads {
   watch_reload_pending: Record<string, never>;
   /** A user saved a new inline review note. */
   note_created: { note: ExtensionReviewNote };
-  /** The body of an in-progress inline review note changed. */
+  /** A draft body changed (`draft: true`) or an existing note was saved (`draft: false`). */
   note_edited: { note: ExtensionReviewNote };
+  /**
+   * A saved ReviewStore note was created, updated, or removed.
+   *
+   * Covers user saves, user deletes, and agent session comments. Drafts never
+   * appear here. A reload that remaps or drops notes does not emit this event;
+   * `session_reload` plus `ctx.review.snapshot()` cover that.
+   */
+  note_changed: { kind: ExtensionNoteChangeKind; note: ExtensionReviewSnapshotNote };
   session_reload: { changeset: ExtensionChangeset; reason: SessionReloadReason };
   shutdown: Record<string, never>;
 }
@@ -1469,20 +1980,22 @@ export type ExtensionEventHandler<Event extends ExtensionEventName = ExtensionEv
  */
 export interface HunkExtensionAPI {
   readonly apiVersion: HunkExtensionApiVersion;
+  /** Configure host-level behavior for the review session loading this extension. */
+  configureSession(options: ExtensionSessionOptions): void;
   /** Contribute one selectable theme. */
   registerTheme(theme: ExtensionThemeConfig): void;
-  /** Map one file extension (with or without a leading dot) to a highlight language. */
-  registerFileLanguage(extension: string, language: string): void;
+  /** Map a file extension, exact filename, or glob to a syntax-highlighting language. */
+  registerFileLanguage(matcher: string | ExtensionFileLanguageMatcher, language: string): void;
   /** Contribute one additional VCS backend. */
   registerVcsAdapter(adapter: ExtensionVcsAdapter): void;
   /**
-   * Contribute a sidebar view beside (or in place of) the built-in one.
+   * Register a docked pane on any terminal edge.
    *
-   * Any number of views can be registered and open simultaneously, on either
-   * side of the review stream. A view that throws while rendering is closed
-   * with a warning naming the extension; the built-in file navigation is
-   * restored if nothing else is showing files.
+   * Any number can be open simultaneously. Hunk owns their exact rectangles,
+   * minimum review bounds, availability, and render-failure containment.
    */
+  registerPane(pane: ExtensionPane): void;
+  /** @deprecated Use registerPane. */
   registerSidebarView(view: ExtensionSidebarView): void;
   /**
    * Register a host-rendered alternative presentation for matching files.
@@ -1493,17 +2006,37 @@ export interface HunkExtensionAPI {
    */
   registerFileView(view: ExtensionFileView): void;
   /**
+   * Register a contributor of character-range marks painted onto diff lines.
+   *
+   * Marks are addressed by source coordinates and painted by the host inside
+   * its own diff rendering — syntax highlighting, word diff, and layout stay
+   * intact. The host resolves each mark's `tone` against the active theme and
+   * line kind, guaranteeing visible contrast the way its own word-diff
+   * emphasis does, and against an assumed background where the cell itself is
+   * transparent.
+   */
+  registerLineHighlighter(highlighter: ExtensionLineHighlighter): void;
+  /**
+   * Register one session-scoped keyboard interpretation.
+   *
+   * Registration alone changes nothing; a command deliberately enters it
+   * through `ctx.keyboardModes.enterMode()`.
+   */
+  registerKeyboardMode(mode: ExtensionKeyboardMode): void;
+  /** Register one generic top-level CLI command subtree. */
+  registerCliCommand(command: ExtensionCliCommand, handler: ExtensionCliCommandHandler): void;
+  /**
    * Register one named command, optionally bound to a key,
    *
    * The handler runs when the key fires outside modal UI (dialogs, menus,
    * focused inputs own their keys first). Handlers receive the standard
-   * context plus sidebar controls, so a command can open the sidebar view its
-   * extension registered.
+   * context plus pane controls, so a command can open the pane its extension
+   * registered.
    */
   registerCommand(command: ExtensionCommand, handler: ExtensionCommandHandler): void;
   /** Rewrite every loaded changeset before review. */
   transformChangeset(fn: ChangesetTransform): void;
-  /** Subscribe to one Hunk lifecycle or UI event. Handlers receive sidebar controls. */
+  /** Subscribe to one Hunk lifecycle or UI event. Handlers receive pane controls. */
   on<Event extends ExtensionEventName>(event: Event, handler: ExtensionEventHandler<Event>): void;
   /** Publish or subscribe to a namespaced event shared with other loaded extensions. */
   readonly events: ExtensionEventBus;

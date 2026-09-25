@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolveCanonicalPath } from "../core/paths";
+import { resolveCanonicalPath } from "../core/run/paths";
 import { join, resolve } from "node:path";
 import { loadExtensions } from "./host";
 import { readExtensionTrust, resolveRepoTrust, writeExtensionTrust } from "./trust";
@@ -184,7 +184,11 @@ describe("extension trust", () => {
 
     expect(result.loaded.map((entry) => entry.id)).toEqual(["repo-local"]);
     expect(result.registry.fileLanguages).toEqual([
-      { extensionId: "repo-local", extension: "repo", language: "typescript" },
+      {
+        extensionId: "repo-local",
+        matcher: { kind: "extension", value: "repo" },
+        language: "typescript",
+      },
     ]);
     expect(result.pendingTrustRepoRoot).toBeUndefined();
   });

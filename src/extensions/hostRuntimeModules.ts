@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { resolveCanonicalPath } from "../core/run/paths";
 
 /**
  * Host-owned modules served to dynamically imported extension files.
@@ -9,7 +10,7 @@ import { dirname } from "node:path";
  * repo-local extension inside a JavaScript project) would resolve to a *second*
  * React whose hooks dispatcher is not the one Hunk renders with. That identity
  * is what makes extension-authored components (hooks included) mountable
- * inside Hunk's own tree — see `registerSidebarView`.
+ * inside Hunk's own tree — see `registerPane`.
  *
  * The mechanism is deliberately scoped to extension source, because the obvious
  * one is not safe: claiming the bare `react` specifier process-wide with a
@@ -160,27 +161,33 @@ function registerVirtualModules() {
 
 /** Register the transpile-and-rewrite hook for one extension directory. */
 function registerSourceRoot(directory: string) {
-  if (registeredSourceRoots.has(directory)) {
-    return;
+  // Bun canonicalizes onLoad paths through symlinks on macOS and Linux, but can
+  // preserve Windows short names. Cover both spellings so every platform reaches
+  // the same host-module rewrite without treating aliases as separate extensions.
+  const sourceRoots = new Set([directory, resolveCanonicalPath(directory)]);
+  for (const sourceRoot of sourceRoots) {
+    if (registeredSourceRoots.has(sourceRoot)) {
+      continue;
+    }
+
+    registeredSourceRoots.add(sourceRoot);
+    // Everything under the directory, so a folder extension's helper modules get
+    // the same rewrite as its entry file. `[/\\]` keeps the boundary correct on
+    // Windows, where `args.path` carries native separators.
+    const escapedDirectory = sourceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const filter = new RegExp(`^${escapedDirectory}[/\\\\].*\\.(?:[mc]?[jt]s|[jt]sx)$`);
+
+    Bun.plugin({
+      name: `hunk-host-extension-source:${sourceRoot}`,
+      setup(build) {
+        build.onLoad({ filter }, async (args) => {
+          const source = await Bun.file(args.path).text();
+          const transpiled = transpilerFor(resolveLoader(args.path)).transformSync(source);
+          return { contents: rewriteHostSpecifiers(transpiled), loader: "js" };
+        });
+      },
+    });
   }
-
-  registeredSourceRoots.add(directory);
-  // Everything under the directory, so a folder extension's helper modules get
-  // the same rewrite as its entry file. `[/\\]` keeps the boundary correct on
-  // Windows, where `args.path` carries native separators.
-  const escapedDirectory = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const filter = new RegExp(`^${escapedDirectory}[/\\\\].*\\.(?:[mc]?[jt]s|[jt]sx)$`);
-
-  Bun.plugin({
-    name: `hunk-host-extension-source:${directory}`,
-    setup(build) {
-      build.onLoad({ filter }, async (args) => {
-        const source = await Bun.file(args.path).text();
-        const transpiled = transpilerFor(resolveLoader(args.path)).transformSync(source);
-        return { contents: rewriteHostSpecifiers(transpiled), loader: "js" };
-      });
-    },
-  });
 }
 
 /**

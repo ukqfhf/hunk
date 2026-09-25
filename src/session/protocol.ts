@@ -4,15 +4,19 @@ import type {
   SessionCommentClearCommandInput,
   SessionCommentListCommandInput,
   SessionCommentRemoveCommandInput,
+  SessionHighlightAddCommandInput,
+  SessionHighlightClearCommandInput,
   SessionNavigateCommandInput,
   SessionReloadCommandInput,
   SessionReviewCommandInput,
   SessionSelectorInput,
-} from "../core/types";
+} from "../core/run/commandInputs";
 import type {
   AppliedCommentBatchResult,
   AppliedCommentResult,
+  AppliedHighlightResult,
   ClearedCommentsResult,
+  ClearedHighlightsResult,
   ListedSession,
   NavigatedSelectionResult,
   ReloadedSessionResult,
@@ -32,7 +36,7 @@ export const HUNK_SESSION_API_VERSION = 1;
  * builds can refresh an older daemon even when it still exposes the same API endpoints. Bump this
  * when daemon-forwarded payloads change, even if the supported action names stay stable.
  */
-export const HUNK_SESSION_DAEMON_VERSION = 6;
+export const HUNK_SESSION_DAEMON_VERSION = 12;
 
 export type SessionDaemonAction =
   | "list"
@@ -45,7 +49,9 @@ export type SessionDaemonAction =
   | "comment-apply"
   | "comment-list"
   | "comment-rm"
-  | "comment-clear";
+  | "comment-clear"
+  | "highlight-add"
+  | "highlight-clear";
 
 export interface SessionDaemonCapabilities {
   version: number;
@@ -79,6 +85,7 @@ export type SessionDaemonRequest =
       side?: "old" | "new";
       line?: number;
       commentDirection?: "next" | "prev";
+      commentId?: string;
     }
   | {
       action: "reload";
@@ -120,17 +127,38 @@ export type SessionDaemonRequest =
       selector: SessionCommentClearCommandInput["selector"];
       filePath?: string;
       includeUser?: boolean;
+    }
+  | {
+      action: "highlight-add";
+      selector: SessionHighlightAddCommandInput["selector"];
+      filePath: string;
+      side: "old" | "new";
+      line: number;
+      start: number;
+      end: number;
+      tone?: "match" | "current" | "info" | "warning" | "error" | "dim";
+      reveal: boolean;
+    }
+  | {
+      action: "highlight-clear";
+      selector: SessionHighlightClearCommandInput["selector"];
+      filePath?: string;
     };
 
-export type SessionDaemonResponse =
-  | { sessions: ListedSession[] }
-  | { session: ListedSession }
-  | { context: SelectedSessionContext }
-  | { review: SessionReview }
-  | { result: NavigatedSelectionResult }
-  | { result: ReloadedSessionResult }
-  | { result: AppliedCommentResult }
-  | { result: AppliedCommentBatchResult }
-  | { comments: Array<SessionLiveCommentSummary | SessionReviewNoteSummary> }
-  | { result: RemovedCommentResult }
-  | { result: ClearedCommentsResult };
+export interface SessionDaemonResponses {
+  list: { sessions: ListedSession[] };
+  get: { session: ListedSession };
+  context: { context: SelectedSessionContext };
+  review: { review: SessionReview };
+  navigate: { result: NavigatedSelectionResult };
+  reload: { result: ReloadedSessionResult };
+  "comment-add": { result: AppliedCommentResult };
+  "comment-apply": { result: AppliedCommentBatchResult };
+  "comment-list": { comments: Array<SessionLiveCommentSummary | SessionReviewNoteSummary> };
+  "comment-rm": { result: RemovedCommentResult };
+  "comment-clear": { result: ClearedCommentsResult };
+  "highlight-add": { result: AppliedHighlightResult };
+  "highlight-clear": { result: ClearedHighlightsResult };
+}
+
+export type SessionDaemonResponse = SessionDaemonResponses[SessionDaemonAction];

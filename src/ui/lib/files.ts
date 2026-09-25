@@ -1,7 +1,8 @@
 import { basename, dirname } from "node:path/posix";
 import type { FileDiffMetadata } from "@pierre/diffs";
-import { normalizeDiffPath } from "../../core/diffPaths";
-import type { AgentAnnotation, DiffFile } from "../../core/types";
+import { normalizeDiffPath } from "../../core/changeset/diffPaths";
+import type { DiffFile } from "../../core/changeset/model";
+import type { AgentAnnotation } from "../../extension-api/types";
 import { readMetadataChangeType } from "../../extensions/events";
 import { formatTerminalPath } from "../../lib/terminalText";
 
@@ -9,6 +10,7 @@ export interface FileListEntry {
   kind: "file";
   id: string;
   name: string;
+  depth: number;
   agentCommentsText: string | null;
   additionsText: string | null;
   deletionsText: string | null;
@@ -43,7 +45,22 @@ export interface FileGroupEntry {
   label: string;
 }
 
-export type SidebarEntry = FileListEntry | FileGroupEntry;
+export interface FileDirectoryEntry {
+  kind: "directory";
+  id: string;
+  label: string;
+  depth: number;
+}
+
+export type FileSidebarMode = "flat" | "tree";
+export type SidebarEntry = FileListEntry | FileGroupEntry | FileDirectoryEntry;
+
+export const TREE_FILE_SIDEBAR_MIN_CONTENT_WIDTH = 32;
+
+/** Choose the compact or hierarchical sidebar projection for an available content width. */
+export function resolveFileSidebarMode(contentWidth: number): FileSidebarMode {
+  return contentWidth >= TREE_FILE_SIDEBAR_MIN_CONTENT_WIDTH ? "tree" : "flat";
+}
 
 /** Build the filename-first label shown inside one sidebar row. */
 function sidebarFileName(file: SidebarFileSource) {
@@ -121,28 +138,25 @@ export function mergeFileAnnotationsByFileId<T extends AgentAnnotation>(
   });
 }
 
-/** Apply the app's file filter query to the visible review stream. */
-export function filterReviewFiles(files: DiffFile[], query: string): DiffFile[] {
-  const trimmedQuery = query.trim().toLowerCase();
-  if (!trimmedQuery) {
-    return files;
-  }
+/** Build the shared file-row metadata used by both sidebar projections. */
+function buildSidebarFileEntry(file: SidebarFileSource, depth: number): FileListEntry {
+  const agentCommentCount = file.agent?.annotations.length ?? 0;
 
-  return files.filter((file) => {
-    const haystack = [
-      normalizeDiffPath(file.path),
-      normalizeDiffPath(file.previousPath),
-      file.agent?.summary,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(trimmedQuery);
-  });
+  return {
+    kind: "file",
+    id: file.id,
+    name: sidebarFileName(file),
+    depth,
+    agentCommentsText: agentCommentCount > 0 ? `*${agentCommentCount}` : null,
+    additionsText: formatSidebarStat("+", file.stats.additions, file.statsTruncated),
+    deletionsText: formatSidebarStat("-", file.stats.deletions),
+    changeType: file.changeType ?? readMetadataChangeType(file.metadata) ?? "change",
+    isUntracked: file.isUntracked ?? false,
+  };
 }
 
-/** Build the grouped sidebar entries while preserving the review stream order. */
-export function buildSidebarEntries(files: readonly SidebarFileSource[]): SidebarEntry[] {
+/** Build compact grouped sidebar entries while preserving the review stream order. */
+export function buildFlatSidebarEntries(files: readonly SidebarFileSource[]): SidebarEntry[] {
   const entries: SidebarEntry[] = [];
   let activeGroup: string | undefined;
 
@@ -159,18 +173,70 @@ export function buildSidebarEntries(files: readonly SidebarFileSource[]): Sideba
       });
     }
 
-    const agentCommentCount = file.agent?.annotations.length ?? 0;
+    entries.push(buildSidebarFileEntry(file, 0));
+  });
 
-    entries.push({
-      kind: "file",
-      id: file.id,
-      name: sidebarFileName(file),
-      agentCommentsText: agentCommentCount > 0 ? `*${agentCommentCount}` : null,
-      additionsText: formatSidebarStat("+", file.stats.additions, file.statsTruncated),
-      deletionsText: formatSidebarStat("-", file.stats.deletions),
-      changeType: file.changeType ?? readMetadataChangeType(file.metadata) ?? "change",
-      isUntracked: file.isUntracked ?? false,
-    });
+  return entries;
+}
+
+/** Split a POSIX review path while retaining its absolute or UNC-style root marker. */
+function sidebarDirectorySegments(parent: string) {
+  if (parent === ".") {
+    return [];
+  }
+
+  const root = parent.match(/^\/+/u)?.[0];
+  const segments = parent.split("/").filter(Boolean);
+  return root ? [root, ...segments] : segments;
+}
+
+/** Format one directory segment without doubling a retained root marker. */
+function sidebarDirectoryLabel(segment: string) {
+  return segment.startsWith("/") ? segment : `${segment}/`;
+}
+
+/** Join directory segments into the stable path represented by one row. */
+function sidebarDirectoryPath(segments: readonly string[]) {
+  const [root, ...rest] = segments;
+  return root?.startsWith("/") ? `${root}${rest.join("/")}` : segments.join("/");
+}
+
+/** Return the number of leading directory segments shared by two active branches. */
+function sharedDirectoryDepth(previous: readonly string[], next: readonly string[]) {
+  const maxDepth = Math.min(previous.length, next.length);
+  let depth = 0;
+
+  while (depth < maxDepth && previous[depth] === next[depth]) {
+    depth += 1;
+  }
+
+  return depth;
+}
+
+/** Build an expanded hierarchy without regrouping files away from review order. */
+export function buildTreeSidebarEntries(files: readonly SidebarFileSource[]): SidebarEntry[] {
+  const entries: SidebarEntry[] = [];
+  let activeDirectories: string[] = [];
+
+  files.forEach((file, fileIndex) => {
+    const path = formatTerminalPath(normalizeDiffPath(file.path) ?? file.path);
+    const parent = dirname(path);
+    const directories = sidebarDirectorySegments(parent);
+    const sharedDepth = sharedDirectoryDepth(activeDirectories, directories);
+
+    for (let depth = sharedDepth; depth < directories.length; depth += 1) {
+      const segment = directories[depth]!;
+      const directoryPath = sidebarDirectoryPath(directories.slice(0, depth + 1));
+      entries.push({
+        kind: "directory",
+        id: `directory:${fileIndex}:${depth}:${directoryPath}`,
+        label: sidebarDirectoryLabel(segment),
+        depth,
+      });
+    }
+
+    entries.push(buildSidebarFileEntry(file, directories.length));
+    activeDirectories = directories;
   });
 
   return entries;

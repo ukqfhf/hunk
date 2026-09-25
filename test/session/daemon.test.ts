@@ -52,7 +52,7 @@ async function readHealth(port: number) {
       return null;
     }
 
-    return (await response.json()) as { ok: boolean; pid: number };
+    return (await response.json()) as { ok: boolean };
   } catch {
     return null;
   }
@@ -75,7 +75,9 @@ afterEach(async () => {
 describe("session daemon lifecycle", () => {
   test("exits cleanly after SIGTERM instead of hot-looping after server shutdown", async () => {
     const port = await reserveLoopbackPort();
-    const proc = Bun.spawn(["bun", "run", "src/main.tsx", "daemon", "serve"], {
+    // Invoke the Bun executable directly so this handle owns the daemon on Windows instead of a
+    // `bun run` launcher that can exit before its child releases the listening socket.
+    const proc = Bun.spawn([process.execPath, "src/main.tsx", "daemon", "serve"], {
       cwd: repoRoot,
       stdin: "ignore",
       stdout: "pipe",
@@ -89,14 +91,15 @@ describe("session daemon lifecycle", () => {
     spawned.push(proc);
 
     const health = await waitUntil("daemon health", () => readHealth(port), 3_000, 50);
-    expect(health).toMatchObject({ ok: true, pid: proc.pid });
+    expect(health).toMatchObject({ ok: true });
 
     let exited = false;
     void proc.exited.then(() => {
       exited = true;
     });
 
-    process.kill(proc.pid, "SIGTERM");
+    // This test owns the spawned process handle; public health intentionally exposes no PID.
+    proc.kill("SIGTERM");
 
     await waitUntil("daemon serve process exit", () => (exited ? true : null), 1_500, 25);
     await waitUntil("daemon port close", async () =>

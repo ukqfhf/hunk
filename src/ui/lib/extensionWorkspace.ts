@@ -18,10 +18,10 @@
  */
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { normalizeDiffPath } from "../../core/diffPaths";
-import type { FileSourceSide } from "../../core/fileSource";
-import { canReloadInput } from "../../core/inputReload";
-import type { CliInput } from "../../core/types";
+import { normalizeDiffPath } from "../../core/changeset/diffPaths";
+import type { FileSourceSide } from "../../core/changeset/fileSource";
+import { canReloadInput } from "../../core/run/inputReload";
+import type { CliInput } from "../../core/run/commandInputs";
 import { readMetadataChangeType } from "../../extensions/events";
 
 /**
@@ -77,7 +77,7 @@ export interface WorkspaceWriteRequestFields {
 function nonWorkingTreeReview(input: CliInput): string | null {
   switch (input.kind) {
     case "vcs":
-      if (input.range) {
+      if (input.range || input.rangeEndpoints) {
         return "a revision range";
       }
 

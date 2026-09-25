@@ -3,23 +3,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, mock, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
-import { act } from "react";
+import { act, useState } from "react";
 import { SESSION_BROKER_REGISTRATION_VERSION } from "@hunk/session-broker-core";
+import type { HunkSessionBrokerClient } from "../session/broker/brokerClient";
 import type {
-  HunkSessionBrokerClient,
   HunkSessionRegistration,
   HunkSessionServerMessage,
   HunkSessionSnapshot,
 } from "../session/types";
-import { LEGACY_CUSTOM_SYNTAX_NOTICE } from "../core/startupNotice";
-import type { AppBootstrap, LayoutMode } from "../core/types";
+import { LEGACY_CUSTOM_SYNTAX_NOTICE } from "../core/process/startupNotice";
+import type { AppBootstrap } from "../core/bootstrap";
+import type { LayoutMode } from "../core/run/commandInputs";
 import { createTestVcsAppBootstrap } from "../../test/helpers/app-bootstrap";
 import { capturedTestColorToHex } from "../../test/helpers/test-color-helpers";
 import { createTestDiffFile as buildTestDiffFile, lines } from "../../test/helpers/diff-helpers";
+import { createEmptyExtensionLoadResult } from "../extensions/types";
 import { AGENT_SKILL_COMMAND, AGENT_SKILL_PROMPT } from "./components/chrome/AgentSkillDialog";
-import { resolveTheme } from "./themes";
+import { App } from "./App";
+import { availableThemes, resolveTheme } from "./themes";
 
-const { loadAppBootstrap } = await import("../core/loaders");
+const { loadAppBootstrap } = await import("../core/changeset/loaders");
 const { AppHost } = await import("./AppHost");
 
 const TEST_KEY_PAGE_UP = "\x1B[5~";
@@ -184,13 +187,14 @@ function createWrapBootstrap(pager = false): AppBootstrap {
   });
 }
 
-function createLineScrollBootstrap(pager = false): AppBootstrap {
+function createLineScrollBootstrap(pager = false, initialMode: LayoutMode = "split"): AppBootstrap {
   const before = lines(...createNumberedAssignmentLines(1, 18));
   const after = lines(...createNumberedAssignmentLines(1, 18, 100));
 
   return createTestVcsAppBootstrap({
     changesetId: "changeset:app-line-scroll",
     files: [createTestDiffFile("scroll", "scroll.ts", before, after, true)],
+    initialMode,
     pager,
   });
 }
@@ -426,6 +430,14 @@ async function flush(setup: Awaited<ReturnType<typeof testRender>>) {
   await act(async () => {
     await setup.renderOnce();
     await Bun.sleep(0);
+    await setup.renderOnce();
+  });
+}
+
+/** Let initial viewport measurement enable row windowing before testing imperative scroll jumps. */
+async function settleViewportMeasurement(setup: Awaited<ReturnType<typeof testRender>>) {
+  await act(async () => {
+    await Bun.sleep(32);
     await setup.renderOnce();
   });
 }
@@ -834,7 +846,7 @@ describe("App interactions", () => {
     }
   });
 
-  test("theme shortcut opens a selector and Enter applies the highlighted theme", async () => {
+  test("theme shortcut opens a selector, j/k move it, and Enter applies the highlighted theme", async () => {
     const setup = await testRender(<AppHost bootstrap={createSingleFileBootstrap()} />, {
       width: 240,
       height: 24,
@@ -847,16 +859,25 @@ describe("App interactions", () => {
         await setup.mockInput.typeText("t");
       });
       let frame = await waitForFrame(setup, (nextFrame) => nextFrame.includes("Theme selector"));
-      expect(frame).toContain("↑/↓/Tab preview  Enter accept  Esc cancel");
       expect(frame).toContain("›  github-dark-default");
       expect(frame).toContain("active");
 
       await act(async () => {
-        await setup.mockInput.pressArrow("down");
+        await setup.mockInput.typeText("j");
       });
       frame = await waitForFrame(setup, (nextFrame) => nextFrame.includes("›  github-dark-dimmed"));
       expect(frame).not.toContain("UI");
       expect(frame).not.toContain("Syntax");
+
+      await act(async () => {
+        await setup.mockInput.typeText("k");
+      });
+      await waitForFrame(setup, (nextFrame) => nextFrame.includes("›  github-dark-default"));
+
+      await act(async () => {
+        await setup.mockInput.typeText("j");
+      });
+      await waitForFrame(setup, (nextFrame) => nextFrame.includes("›  github-dark-dimmed"));
 
       await act(async () => {
         await setup.mockInput.pressEnter();
@@ -873,7 +894,7 @@ describe("App interactions", () => {
     }
   });
 
-  test("theme selector mouse hover does not preview and click selects without accepting", async () => {
+  test("theme selector waits for mouse hover to settle before previewing", async () => {
     const setup = await testRender(<AppHost bootstrap={createSingleFileBootstrap()} />, {
       width: 240,
       height: 24,
@@ -889,29 +910,36 @@ describe("App interactions", () => {
       expect(frame).toContain("›  github-dark-default");
 
       const lines = frame.split("\n");
-      const targetY = lines.findIndex((line) => line.includes("github-dark-dimmed"));
-      expect(targetY).toBeGreaterThanOrEqual(0);
-      const targetX = Math.max(0, lines[targetY]!.indexOf("github-dark-dimmed"));
+      const dimmedY = lines.findIndex((line) => line.includes("github-dark-dimmed"));
+      const highContrastY = lines.findIndex((line) => line.includes("github-dark-high-contrast"));
+      expect(dimmedY).toBeGreaterThanOrEqual(0);
+      expect(highContrastY).toBeGreaterThanOrEqual(0);
+      const targetX = Math.max(0, lines[dimmedY]!.indexOf("github-dark-dimmed"));
 
       await act(async () => {
-        await setup.mockMouse.moveTo(targetX, targetY);
+        await setup.mockMouse.moveTo(targetX, dimmedY);
+        await setup.mockMouse.moveTo(targetX, highContrastY);
       });
       await flush(setup);
       frame = setup.captureCharFrame();
       expect(frame).toContain("›  github-dark-default");
       expect(frame).not.toContain("›  github-dark-dimmed");
+      expect(frame).not.toContain("›  github-dark-high-contrast");
 
       await act(async () => {
-        await setup.mockMouse.click(targetX, targetY);
-      });
-      frame = await waitForFrame(setup, (nextFrame) => nextFrame.includes("›  github-dark-dimmed"));
-      expect(frame).toContain("Theme selector");
-
-      await act(async () => {
-        await setup.mockInput.pressEnter();
+        await new Promise((resolve) => setTimeout(resolve, 250));
       });
       frame = await waitForFrame(setup, (nextFrame) =>
-        nextFrame.includes("Theme: github-dark-dimmed"),
+        nextFrame.includes("›  github-dark-high-contrast"),
+      );
+      expect(frame).toContain("Theme selector");
+      expect(frame).not.toContain("›  github-dark-default");
+
+      await act(async () => {
+        await setup.mockMouse.click(targetX, highContrastY);
+      });
+      frame = await waitForFrame(setup, (nextFrame) =>
+        nextFrame.includes("Theme: github-dark-high-contrast"),
       );
       expect(frame).not.toContain("Theme selector");
     } finally {
@@ -921,7 +949,7 @@ describe("App interactions", () => {
     }
   });
 
-  test("theme selector mouse wheel previews the next row", async () => {
+  test("theme selector mouse wheel scrolls the window without changing the preview", async () => {
     const setup = await testRender(<AppHost bootstrap={createSingleFileBootstrap()} />, {
       width: 240,
       height: 24,
@@ -936,13 +964,20 @@ describe("App interactions", () => {
       const frame = await waitForFrame(setup, (nextFrame) =>
         nextFrame.includes("›  github-dark-default"),
       );
+      expect(frame).not.toContain("gruvbox-dark-medium");
       const selectedY = frame.split("\n").findIndex((line) => line.includes("github-dark-default"));
       expect(selectedY).toBeGreaterThanOrEqual(0);
 
       await act(async () => {
         await setup.mockMouse.scroll(120, selectedY, "down");
       });
-      await waitForFrame(setup, (nextFrame) => nextFrame.includes("›  github-dark-dimmed"));
+      await waitForFrame(
+        setup,
+        (nextFrame) =>
+          nextFrame.includes("gruvbox-dark-medium") &&
+          nextFrame.includes("›  github-dark-default") &&
+          !nextFrame.includes("›  github-dark-dimmed"),
+      );
     } finally {
       await act(async () => {
         setup.renderer.destroy();
@@ -1044,6 +1079,94 @@ describe("App interactions", () => {
         nextFrame.includes("›  github-dark-default"),
       );
       expect(frame).toContain("active");
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
+  test("theme events report only explicit acceptance, not previews or catalog projection", async () => {
+    const custom = {
+      id: "session-custom",
+      label: "Session custom",
+      base: "github-dark-default",
+      accent: "#8877cc",
+    };
+    const bootstrap = createSingleFileBootstrap();
+    const extensions = createEmptyExtensionLoadResult(process.cwd());
+    const themeEvents: string[] = [];
+    extensions.registry.eventHandlers.theme_changed.push({
+      extensionId: "theme-probe",
+      handler: ({ themeId }) => {
+        themeEvents.push(themeId);
+      },
+    });
+    bootstrap.initialTheme = custom.id;
+    bootstrap.customThemes = [custom];
+    bootstrap.extensions = extensions;
+    let replaceCustomThemes!: (themes: AppBootstrap["customThemes"]) => void;
+
+    function ThemeEventProbe() {
+      const [currentBootstrap, setCurrentBootstrap] = useState(bootstrap);
+      replaceCustomThemes = (themes) =>
+        setCurrentBootstrap((current) => ({ ...current, customThemes: themes }));
+      return (
+        <App
+          bootstrap={currentBootstrap}
+          onRegisterWorkspaceRefreshRequest={() => () => {}}
+          onReloadSession={async () => {
+            throw new Error("Theme event test does not reload the session.");
+          }}
+          onWorkspaceWriteCompleted={() => {}}
+          runWorkspaceWrite={async (write) => {
+            await write();
+            return true;
+          }}
+        />
+      );
+    }
+
+    const setup = await testRender(<ThemeEventProbe />, { width: 240, height: 24 });
+    try {
+      await flush(setup);
+      expect(themeEvents).toEqual([]);
+
+      await act(async () => {
+        await setup.mockInput.typeText("t");
+      });
+      await waitForFrame(setup, (frame) => frame.includes("Theme selector"));
+      await act(async () => {
+        await setup.mockInput.pressArrow("down");
+      });
+      await flush(setup);
+      expect(themeEvents).toEqual([]);
+
+      await act(async () => {
+        await setup.mockInput.pressEscape();
+      });
+      await waitForFrame(setup, (frame) => !frame.includes("Theme selector"));
+      expect(themeEvents).toEqual([]);
+
+      await act(async () => replaceCustomThemes([]));
+      await flush(setup);
+      expect(themeEvents).toEqual([]);
+
+      await act(async () => replaceCustomThemes([custom]));
+      await flush(setup);
+      expect(themeEvents).toEqual([]);
+
+      await act(async () => {
+        await setup.mockInput.typeText("t");
+      });
+      await waitForFrame(setup, (frame) => frame.includes("Theme selector"));
+      await act(async () => {
+        await setup.mockInput.pressArrow("down");
+        await setup.mockInput.pressEnter();
+      });
+      await flush(setup);
+
+      expect(themeEvents).toEqual([availableThemes([custom])[0]!.id]);
     } finally {
       await act(async () => {
         setup.renderer.destroy();
@@ -1172,9 +1295,6 @@ describe("App interactions", () => {
         });
         await flush(setup);
         frame = setup.captureCharFrame();
-        if (frame.includes("interaction coverage")) {
-          break;
-        }
       }
 
       expect(frame).toContain("interaction coverage");
@@ -1186,9 +1306,6 @@ describe("App interactions", () => {
         });
         await flush(setup);
         frame = setup.captureCharFrame();
-        if (frame.includes("this is a very")) {
-          break;
-        }
       }
 
       expect(frame).toContain("this is a very");
@@ -2442,6 +2559,7 @@ describe("App interactions", () => {
 
     try {
       await flush(setup);
+      await settleViewportMeasurement(setup);
       let frame = setup.captureCharFrame();
       expect(frame).toContain("line01 = 1001");
 
@@ -2458,6 +2576,39 @@ describe("App interactions", () => {
       await flush(setup);
       frame = setup.captureCharFrame();
       expect(frame).toContain("line01 = 1001");
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
+  test("G supersedes a pending selected-hunk reveal", async () => {
+    const setup = await testRender(
+      <AppHost bootstrap={createCrossFileHunkNavigationBootstrap()} />,
+      {
+        width: 120,
+        height: 16,
+      },
+    );
+
+    try {
+      await flush(setup);
+      await settleViewportMeasurement(setup);
+      await pressHunkNavigationKey(setup, "]", 1);
+
+      await act(async () => {
+        await setup.mockInput.pressKey("g", { shift: true });
+      });
+      await flush(setup);
+      await act(async () => {
+        await Bun.sleep(160);
+        await setup.renderOnce();
+      });
+
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("export const mid = 4;");
+      expect(frame).not.toContain("line 021 changed");
     } finally {
       await act(async () => {
         setup.renderer.destroy();
@@ -2505,6 +2656,7 @@ describe("App interactions", () => {
 
     try {
       await flush(setup);
+      await settleViewportMeasurement(setup);
       let frame = setup.captureCharFrame();
       expect(frame).toContain("line01 = 1001");
 
@@ -2803,6 +2955,56 @@ describe("App interactions", () => {
     }
   });
 
+  test("coalesced line movement opens a draft at the latest cursor without moving its row", async () => {
+    const setup = await testRender(
+      <AppHost bootstrap={createLineScrollBootstrap(false, "stack")} />,
+      { width: 120, height: 26 },
+    );
+
+    try {
+      await flush(setup);
+      await act(async () => {
+        await Bun.sleep(60);
+        await setup.renderOnce();
+      });
+
+      const initial = setup.captureCharFrame();
+      const initialActiveRow = initial
+        .split("\n")
+        .findIndex((line) => line.includes("export const line01 = 1;"));
+      const followingRowBefore = initial
+        .split("\n")
+        .findIndex((line) => line.includes("export const line10 = 10;"));
+
+      await act(async () => {
+        await setup.mockInput.pressKeys([...Array(8).fill("\x1b[B"), "c"]);
+      });
+      await flush(setup);
+      await act(async () => {
+        await Bun.sleep(80);
+        await setup.renderOnce();
+      });
+
+      const withDraft = setup.captureCharFrame();
+      const activeRow = withDraft
+        .split("\n")
+        .findIndex((line) => line.includes("export const line09 = 9;"));
+      const draftRow = withDraft.split("\n").findIndex((line) => line.includes("Draft note"));
+      const followingRow = withDraft
+        .split("\n")
+        .findIndex((line) => line.includes("export const line10 = 10;"));
+
+      expect(withDraft).toMatch(/Draft note.*L9/);
+      expect(activeRow).toBe(initialActiveRow + 8);
+      expect(draftRow).toBe(activeRow + 1);
+      expect(followingRow).toBeGreaterThan(followingRowBefore);
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
   test("draft note focus suppresses app shortcuts while accepting typed shortcut keys", async () => {
     const setup = await testRender(<AppHost bootstrap={createBootstrap()} />, {
       width: 240,
@@ -2831,6 +3033,72 @@ describe("App interactions", () => {
       expect(frame).toContain("Draft note");
       expect(frame).toContain("s");
       expect((frame.match(/beta\.ts/g) ?? []).length).toBe(betaCountWithSidebar);
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
+  test("draft note wraps long CJK input instead of scrolling it out of view", async () => {
+    const setup = await testRender(<AppHost bootstrap={createBootstrap()} />, {
+      width: 160,
+      height: 40,
+    });
+
+    try {
+      await flush(setup);
+
+      await act(async () => {
+        await setup.mockInput.typeText("c");
+      });
+      await flush(setup);
+
+      const body =
+        "这个包主要是为了在普通的chatmodel外面包一层,在外层把toolcallid统一转换,方便后续处理";
+      for (const chunk of body.match(/.{1,12}/g) ?? []) {
+        await act(async () => {
+          await setup.mockInput.typeText(chunk);
+        });
+        await flush(setup);
+      }
+
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Draft note");
+      expect(frame).toContain(body.slice(0, 10));
+      expect(frame).toContain(body.slice(-4));
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
+  test("draft note survives a large burst of input in one chunk", async () => {
+    const setup = await testRender(<AppHost bootstrap={createBootstrap()} />, {
+      width: 160,
+      height: 40,
+    });
+
+    try {
+      await flush(setup);
+
+      await act(async () => {
+        await setup.mockInput.typeText("c");
+      });
+      await flush(setup);
+
+      // One synchronous burst, the shape chunked pastes and key repeats take.
+      const text = "the quick brown fox jumps over the lazy dog 0123456789".repeat(3);
+      await act(async () => {
+        await setup.mockInput.typeText(text);
+      });
+      await flush(setup);
+
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Draft note");
+      expect(frame).toContain(text.slice(0, 10));
+      expect(frame).toContain(text.slice(-6));
     } finally {
       await act(async () => {
         setup.renderer.destroy();
@@ -2988,7 +3256,7 @@ describe("App interactions", () => {
 
   test("sidebar shortcut can force the sidebar open when responsive layout hides it", async () => {
     const setup = await testRender(<AppHost bootstrap={createBootstrap("auto")} />, {
-      width: 160,
+      width: 159,
       height: 24,
     });
 
@@ -3392,9 +3660,15 @@ describe("App interactions", () => {
         await flush(setup);
       }
 
+      const secondFileY = setup
+        .captureCharFrame()
+        .split("\n")
+        .findIndex((line) => line.split("│", 1)[0]?.includes("second.ts"));
+      expect(secondFileY).toBeGreaterThan(0);
+
       await act(async () => {
-        // Click inside the second file row below the repo-root group header.
-        await setup.mockMouse.click(6, 5);
+        // Target the rendered file row so flat and tree projections share this interaction proof.
+        await setup.mockMouse.click(6, secondFileY);
       });
       await flush(setup);
 
@@ -3700,6 +3974,37 @@ describe("App interactions", () => {
 
       expect(quit).toHaveBeenCalledTimes(1);
       expect(setup.captureCharFrame()).not.toContain("Save view preferences?");
+    } finally {
+      await act(async () => {
+        setup.renderer.destroy();
+      });
+    }
+  });
+
+  test("transient extension sessions never offer to save practice view preferences", async () => {
+    const quit = mock(() => undefined);
+    const bootstrap = createSingleFileBootstrap();
+    const extensions = createEmptyExtensionLoadResult(process.cwd());
+    extensions.registry.sessionOptions.push({
+      extensionId: "trainer",
+      options: { viewPreferences: "transient" },
+    });
+    bootstrap.extensions = extensions;
+    const setup = await testRender(<AppHost bootstrap={bootstrap} onQuit={quit} />, {
+      width: 180,
+      height: 24,
+    });
+
+    try {
+      await flush(setup);
+      await act(async () => {
+        await setup.mockInput.typeText("w");
+        await setup.mockInput.typeText("q");
+      });
+      await flush(setup);
+
+      expect(setup.captureCharFrame()).not.toContain("Save view preferences?");
+      expect(quit).toHaveBeenCalledTimes(1);
     } finally {
       await act(async () => {
         setup.renderer.destroy();

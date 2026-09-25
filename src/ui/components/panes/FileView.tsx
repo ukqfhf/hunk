@@ -1,6 +1,6 @@
 import { TextAttributes } from "@opentui/core";
 import { Component, memo, useMemo, type ReactNode } from "react";
-import type { DiffFile } from "../../../core/types";
+import type { DiffFile } from "../../../core/changeset/model";
 import type {
   ExtensionFileViewLayout,
   ExtensionFileViewRow,
@@ -9,7 +9,7 @@ import type {
 } from "../../../extension-api/types";
 import type { AppTheme } from "../../themes";
 import type { DiffSectionGeometry } from "../../diff/diffSectionGeometry";
-import { plannedRowMatchesCursor, type CursorHighlight } from "../../diff/renderRows";
+import { plannedRowMatchesCursor, type CursorHighlight } from "../../diff/cursorHighlight";
 import { cursorLineHighlightBg } from "../../diff/rowStyle";
 import { resolveVisibleRowIndexWindow, type VisibleBodyBounds } from "../../diff/rowWindowing";
 import { reviewRowId } from "../../lib/ids";
@@ -174,7 +174,8 @@ function FileViewComponent({
                 noteCount={plannedRow.noteCount}
                 noteIndex={plannedRow.noteIndex}
                 draft={plannedRow.note.draft}
-                onClose={plannedRow.note.onRemove}
+                actions={plannedRow.note.actions}
+                thread={plannedRow.note.thread}
                 theme={theme}
                 width={width}
               />

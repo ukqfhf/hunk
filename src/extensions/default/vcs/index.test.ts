@@ -51,7 +51,7 @@ describe("bundled extension tier", () => {
     expect(getBundledVcsAdapters()[0]).toBe(first.registry.vcsAdapters[0]?.adapter);
   });
 
-  test("registers Jujutsu and Sapling above the Git baseline", () => {
+  test("registers Arc, Jujutsu, and Sapling above the Git baseline", () => {
     const byId = new Map(
       getBundledVcsAdapters().map((adapter) => [adapter.id, adapter.detectionPriority ?? 0]),
     );
@@ -59,6 +59,7 @@ describe("bundled extension tier", () => {
     // A colocated jj or Sapling checkout carries Git metadata too, so both must
     // outrank Git for the same directory.
     expect(byId.get("git")).toBe(0);
+    expect(byId.get("arc")).toBeGreaterThan(byId.get("git")!);
     expect(byId.get("sl")).toBeGreaterThan(byId.get("git")!);
     expect(byId.get("jj")).toBeGreaterThan(byId.get("sl")!);
   });

@@ -24,13 +24,18 @@ This reference is generated from the command metadata used by Hunk itself. Run `
 | `--agent-context <path>`    | JSON sidecar with agent rationale                               |
 | `--pager`                   | use pager-style chrome                                          |
 | `--experimental`            | enable experimental features (currently STML agent-note markup) |
+| `--fast`                    | experimentally offload eligible syntax highlighting             |
 | `--line-numbers`            | show line numbers                                               |
 | `--no-line-numbers`         | hide line numbers                                               |
 | `-x, --tab-width <columns>` | tab stop width: 1-16 Default: 4.                                |
+| `--file-gap <rows>`         | file separator rows, including the ─ rule: 0-8 Default: 1.      |
+| `--hunk-gap <rows>`         | blank rows before each later hunk: 0-8 Default: 0.              |
 | `--wrap`                    | wrap long diff lines                                            |
 | `--no-wrap`                 | truncate long diff lines to one row                             |
 | `--hunk-headers`            | show hunk metadata rows                                         |
 | `--no-hunk-headers`         | hide hunk metadata rows                                         |
+| `--sidebar`                 | show files pane                                                 |
+| `--no-sidebar`              | hide files pane                                                 |
 | `--agent-notes`             | show agent notes by default                                     |
 | `--no-agent-notes`          | hide agent notes by default                                     |
 | `--transparent-bg`          | let terminal background show through Hunk surfaces              |
@@ -48,14 +53,20 @@ review diffs or compare two concrete files
 
 ```bash
 hunk diff [target] [-- <pathspec...>]
+hunk diff <from> <to> [-- <pathspec...>]
 hunk diff --staged [-- <pathspec...>]
-hunk diff <left> <right>
+hunk diff --files <left> <right>
 ```
+
+Two positional arguments always name revision endpoints, even when matching files exist on disk.
+
+Use `--files <left> <right>` for concrete-file comparison; this replaces the former filesystem-existence disambiguation.
 
 ### Command-specific options
 
 | Option                   | Description                                                                                   |
 | ------------------------ | --------------------------------------------------------------------------------------------- |
+| `--files <paths...>`     | compare exactly two concrete files: --files &lt;left&gt; &lt;right&gt;                        |
 | `--staged`               | show staged changes instead of the working tree                                               |
 | `--cached`               | alias for --staged                                                                            |
 | `--exclude-untracked`    | exclude untracked files from working tree reviews                                             |
@@ -172,6 +183,81 @@ print a bundled Hunk skill path
 hunk skill path [name]
 ```
 
+## `hunk extension install`
+
+install a shared extension from a git repository
+
+### Usage
+
+```bash
+hunk extension install <owner>/<repo>[@ref]
+hunk extension install git:<host>/<path>[@ref]
+hunk extension install <git-url or local path>[@ref]
+```
+
+**Aliases:** `hunk ext install`.
+
+### Command-specific options
+
+| Option  | Description                                           |
+| ------- | ----------------------------------------------------- |
+| `--yes` | skip the confirmation prompt (required without a TTY) |
+
+## `hunk extension list`
+
+list extensions installed with `hunk extension install`
+
+### Usage
+
+```bash
+hunk extension list
+```
+
+**Aliases:** `hunk ext list`.
+
+## `hunk extension update`
+
+re-clone managed extension installs from their recorded sources
+
+### Usage
+
+```bash
+hunk extension update [name]
+```
+
+**Aliases:** `hunk ext update`.
+
+## `hunk extension remove`
+
+remove one managed extension install
+
+### Usage
+
+```bash
+hunk extension remove <name>
+```
+
+**Aliases:** `hunk ext remove`.
+
+## `hunk update`
+
+update Hunk with the package manager that installed it
+
+### Usage
+
+```bash
+hunk update [version]
+hunk update --check
+hunk update --method <npm|brew|curl>
+```
+
+### Command-specific options
+
+| Option              | Description                                                    |
+| ------------------- | -------------------------------------------------------------- |
+| `--method <method>` | install method instead of the detected one: npm, brew, curl    |
+| `--check`           | report the installed and available versions without installing |
+
 ## `hunk daemon serve`
 
 run the local Hunk session daemon and websocket session broker
@@ -261,6 +347,7 @@ move a live Hunk session to one diff hunk
 
 ```bash
 hunk session navigate (<session-id> | --repo <path>) --file <path> (--hunk <n> | --old-line <n> | --new-line <n>) [--json]
+hunk session navigate (<session-id> | --repo <path>) --comment <id> [--json]
 hunk session navigate (<session-id> | --repo <path>) (--next-comment | --prev-comment) [--json]
 ```
 
@@ -271,13 +358,14 @@ hunk session navigate (<session-id> | --repo <path>) (--next-comment | --prev-co
 | `--hunk <n>`     | 1-based hunk number within the file                       |
 | `--old-line <n>` | 1-based line number on the old side                       |
 | `--new-line <n>` | 1-based line number on the new side                       |
+| `--comment <id>` | jump to the live comment with this id                     |
 | `--next-comment` | jump to the next annotated hunk                           |
 | `--prev-comment` | jump to the previous annotated hunk                       |
 | `--json`         | emit structured JSON                                      |
 
 **Positionals:** `[sessionId]`.
 
-**Constraints:** exactly one of `--hunk <n>`, `--old-line <n>`, `--new-line <n>`; at most one of `--next-comment`, `--prev-comment`.
+**Constraints:** for `--file` navigation, exactly one of `--hunk <n>`, `--old-line <n>`, `--new-line <n>`; at most one of `--next-comment`, `--prev-comment`.
 
 **Examples:**
 
@@ -285,6 +373,7 @@ hunk session navigate (<session-id> | --repo <path>) (--next-comment | --prev-co
 hunk session navigate --repo . --file src/App.tsx --hunk 2
 hunk session navigate --repo . --file src/App.tsx --new-line 372
 hunk session navigate --repo . --file src/App.tsx --old-line 355
+hunk session navigate --repo . --comment comment-1
 hunk session navigate --repo . --next-comment
 hunk session navigate --repo . --prev-comment
 ```
@@ -439,3 +528,56 @@ hunk session comment clear (<session-id> | --repo <path>) [--file <path>] [--inc
 | `--json`         | emit structured JSON                                      |
 
 **Positionals:** `[sessionId]`.
+
+### `hunk session highlight add`
+
+paint one attention mark inside a diff line
+
+```bash
+hunk session highlight add (<session-id> | --repo <path>) --file <path> (--old-line <n> | --new-line <n>) --start <n> --end <n> [--tone <tone>] [--focus] [--json]
+```
+
+| Option           | Description                                                                       |
+| ---------------- | --------------------------------------------------------------------------------- |
+| `--file <path>`  | diff file path as shown by Hunk Required.                                         |
+| `--start <n>`    | 0-based inclusive start offset into the line's text (UTF-16 code units) Required. |
+| `--end <n>`      | exclusive end offset; must be greater than --start Required.                      |
+| `--repo <path>`  | target the live session whose repo root matches this path                         |
+| `--old-line <n>` | 1-based line number on the old side                                               |
+| `--new-line <n>` | 1-based line number on the new side                                               |
+| `--tone <tone>`  | mark tone: match, current, info, warning, error, dim (default match)              |
+| `--focus`        | add the mark and land the viewport on its line                                    |
+| `--json`         | emit structured JSON                                                              |
+
+**Positionals:** `[sessionId]`.
+
+**Constraints:** exactly one of `--old-line <n>`, `--new-line <n>`.
+
+**Examples:**
+
+```bash
+hunk session highlight add --repo . --file src/App.tsx --new-line 42 --start 6 --end 19
+hunk session highlight add --repo . --file src/App.tsx --new-line 42 --start 6 --end 19 --tone warning --focus
+```
+
+### `hunk session highlight clear`
+
+clear agent attention marks
+
+```bash
+hunk session highlight clear (<session-id> | --repo <path>) [--file <path>] [--json]
+```
+
+| Option          | Description                                               |
+| --------------- | --------------------------------------------------------- |
+| `--repo <path>` | target the live session whose repo root matches this path |
+| `--file <path>` | clear only one diff file's marks                          |
+| `--json`        | emit structured JSON                                      |
+
+**Positionals:** `[sessionId]`.
+
+**Examples:**
+
+```bash
+hunk session highlight clear --repo .
+```

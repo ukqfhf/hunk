@@ -5,9 +5,11 @@
  * active layout draws and carry the plan anchor rendering, reveal, and note placement already use.
  */
 
-import type { DiffFile, UserNoteLineTarget } from "../../core/types";
+import type { DiffFile } from "../../core/changeset/model";
+import type { UserNoteLineTarget } from "../../core/liveComments";
 import type { DiffSectionGeometry, DiffSectionRowBounds } from "../diff/diffSectionGeometry";
 import {
+  contextLineStableKeySides,
   contextLineStableKeyTarget,
   lineStableKey,
   lineStableKeyTarget,
@@ -104,6 +106,41 @@ export function buildLineCursors(
   });
 }
 
+/** Reuse the previous ordered cursor list when remeasurement preserved every navigation target. */
+export function reuseEquivalentLineCursors(previous: LineCursor[], next: LineCursor[]) {
+  if (
+    previous.length === next.length &&
+    next.every((cursor, index) => {
+      const prior = previous[index];
+      return (
+        prior?.fileId === cursor.fileId &&
+        prior.hunkIndex === cursor.hunkIndex &&
+        prior.stableKey === cursor.stableKey &&
+        prior.expandedGapKey === cursor.expandedGapKey &&
+        prior.target.side === cursor.target.side &&
+        prior.target.line === cursor.target.line
+      );
+    })
+  ) {
+    return previous;
+  }
+  return next;
+}
+
+/** Create a cursor stabilizer that only compares newly measured lists. */
+export function createLineCursorStabilizer() {
+  let measured = EMPTY_LINE_CURSORS;
+  let stable = EMPTY_LINE_CURSORS;
+
+  return (next: LineCursor[]) => {
+    if (measured !== next) {
+      measured = next;
+      stable = reuseEquivalentLineCursors(stable, next);
+    }
+    return stable;
+  };
+}
+
 /** Find the first cursor in one hunk, then anywhere in its file. */
 function nearestCursorInFile(cursors: LineCursor[], fileId: string, hunkIndex: number) {
   return (
@@ -192,6 +229,39 @@ export function lineCursorAt(
       stableKey: lineStableKey(hunkIndex, target.side, target.line),
       target,
     }
+  );
+}
+
+/**
+ * Check whether one cursor stands on the source line a caller named.
+ *
+ * A context row carries a single new-side target but renders one line under both sides'
+ * numbers, so its old-side number addresses the same stop.
+ */
+function lineCursorAddresses(cursor: LineCursor, side: "old" | "new", line: number) {
+  if (cursor.target.side === side && cursor.target.line === line) {
+    return true;
+  }
+
+  const context = contextLineStableKeySides(cursor.stableKey);
+  return context !== null && (side === "old" ? context.oldLine : context.newLine) === line;
+}
+
+/**
+ * Find the rendered stop one file's source line sits on, addressed by side and number.
+ *
+ * Answers only for lines the review stream actually draws: a line hidden inside a collapsed
+ * gap, or absent from a partial patch, has no cursor and no measured row to scroll to.
+ */
+export function findLineCursorAt(
+  cursors: LineCursor[],
+  fileId: string,
+  side: "old" | "new",
+  line: number,
+): LineCursor | null {
+  return (
+    cursors.find((cursor) => cursor.fileId === fileId && lineCursorAddresses(cursor, side, line)) ??
+    null
   );
 }
 

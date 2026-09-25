@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { collectSessionCustomThemes } from "../core/customThemes";
-import type { Changeset } from "../core/types";
-import { detectVcs, resolveVcsAdapters } from "../core/vcs";
+import { collectSessionCustomThemes } from "../core/theme/customThemes";
+import type { Changeset } from "../core/changeset/model";
+import { detectVcs, extendVcsCatalog } from "../core/vcs";
+import { getBundledVcsCatalog } from "../app/vcsCatalog";
 import { createTestDiffFile } from "../../test/helpers/diff-helpers";
 import {
   applyExtensionChangesetTransforms,
+  applyExtensionFileLanguages,
   applyExtensionRegistrations,
   resolveDetectedVcsIdWithExtensions,
   resolveSessionVcsId,
@@ -71,6 +73,8 @@ function createTestChangeset(): Changeset {
 }
 
 /** Values a JavaScript extension plausibly passes where an object was expected. */
+const BASE_VCS_CATALOG = getBundledVcsCatalog();
+
 const JUNK_VALUES = [
   undefined,
   null,
@@ -168,7 +172,73 @@ describe("registerFileLanguage with junk", () => {
     );
 
     expect(issues).toEqual([]);
-    expect(registry.fileLanguages.map((entry) => entry.extension)).toEqual(["zig", "bzl"]);
+    expect(registry.fileLanguages.map((entry) => entry.matcher)).toEqual([
+      { kind: "extension", value: "zig" },
+      { kind: "extension", value: "bzl" },
+    ]);
+  });
+
+  test("preserves exact filename and glob values through matching", async () => {
+    const { fileLanguageForPath } = await import("../core/changeset/fileLanguageLookup");
+    const { registry, issues } = loadFactory(
+      (hunk: { registerFileLanguage: (matcher: unknown, language: string) => void }) => {
+        hunk.registerFileLanguage({ kind: "filename", value: " Tool\\Hunkfile " }, "python");
+        hunk.registerFileLanguage({ kind: "filename", value: " " }, "python");
+        hunk.registerFileLanguage({ kind: "glob", value: "*.hunk ", target: "basename" }, "ruby");
+        hunk.registerFileLanguage({ kind: "glob", value: "  ", target: "basename" }, "ruby");
+        hunk.registerFileLanguage({ kind: "glob", value: " *\\name ", target: "basename" }, "ruby");
+        hunk.registerFileLanguage({ kind: "glob", value: "foo?bar", target: "basename" }, "json");
+        hunk.registerFileLanguage(
+          { kind: "glob", value: "generated/**/*.ts", target: "path" },
+          "typescript",
+        );
+        hunk.registerFileLanguage({ kind: "extension", value: "  .HunkExact  " }, "typescript");
+      },
+    );
+
+    expect(issues).toEqual([]);
+    expect(registry.fileLanguages.map((entry) => entry.matcher)).toEqual([
+      { kind: "filename", value: " Tool\\Hunkfile " },
+      { kind: "filename", value: " " },
+      { kind: "glob", value: "*.hunk ", target: "basename" },
+      { kind: "glob", value: "  ", target: "basename" },
+      { kind: "glob", value: " *\\name ", target: "basename" },
+      { kind: "glob", value: "foo?bar", target: "basename" },
+      { kind: "glob", value: "generated/**/*.ts", target: "path" },
+      { kind: "extension", value: "hunkexact" },
+    ]);
+
+    expect(applyExtensionFileLanguages(registry)).toEqual([]);
+    expect(fileLanguageForPath("nested/ Tool\\Hunkfile ")).toBe("python");
+    expect(fileLanguageForPath("nested/ ")).toBe("python");
+    expect(fileLanguageForPath("nested/example.hunk ")).toBe("ruby");
+    expect(fileLanguageForPath("nested/  ")).toBe("ruby");
+    expect(fileLanguageForPath("nested/ x\\name ")).toBe("ruby");
+    expect(fileLanguageForPath("nested/foo\\bar")).toBe("json");
+    expect(fileLanguageForPath("nested/foo\0bar")).toBe("text");
+    expect(fileLanguageForPath("generated/nested/example.ts")).toBe("typescript");
+    expect(fileLanguageForPath("nested/example.hunkexact")).toBe("typescript");
+  });
+
+  test("refuses malformed matcher objects", () => {
+    for (const matcher of [
+      { kind: "filename", value: "" },
+      { kind: "filename", value: "path/Hunkfile" },
+      { kind: "glob", value: "*.ts" },
+      { kind: "glob", value: "*.ts", target: "somewhere" },
+      { kind: "glob", value: "*\0name", target: "basename" },
+      { kind: "regex", value: ".*" },
+      /.*\.ts/,
+    ]) {
+      const { registry, issues } = loadFactory(
+        (hunk: { registerFileLanguage: (matcher: unknown, language: string) => void }) => {
+          hunk.registerFileLanguage(matcher, "python");
+        },
+      );
+
+      expect(issues).toHaveLength(1);
+      expect(registry.fileLanguages).toEqual([]);
+    }
   });
 });
 
@@ -235,11 +305,11 @@ describe("registerVcsAdapter with junk", () => {
         expect(detected.id).toBe("hg");
       }
 
-      // Detection over the full adapter list never throws either.
-      expect(() => detectVcs("/repo", [adapter!])).not.toThrow();
-      expect(() => resolveVcsAdapters([adapter!])).not.toThrow();
-      expect(() => resolveDetectedVcsIdWithExtensions("/repo", [adapter!])).not.toThrow();
-      expect(() => resolveSessionVcsId("hg", "/repo", [adapter!])).not.toThrow();
+      // Detection over the complete catalog never throws either.
+      const catalog = extendVcsCatalog(BASE_VCS_CATALOG, [adapter!]);
+      expect(() => detectVcs("/repo", catalog)).not.toThrow();
+      expect(() => resolveDetectedVcsIdWithExtensions("/repo", catalog)).not.toThrow();
+      expect(() => resolveSessionVcsId("hg", "/repo", catalog)).not.toThrow();
     }
   });
 
@@ -257,7 +327,7 @@ describe("registerVcsAdapter with junk", () => {
     const adapters = registry.vcsAdapters.map((entry) => entry.adapter);
     // Hunk's own repo is a Git checkout, so a throwing extension adapter must
     // not prevent Git from being detected.
-    expect(detectVcs(process.cwd(), adapters)?.id).toBe("git");
+    expect(detectVcs(process.cwd(), extendVcsCatalog(BASE_VCS_CATALOG, adapters))?.id).toBe("git");
   });
 
   test("an adapter whose operations are unusable reports unsupported, not a TypeError", () => {
@@ -290,10 +360,13 @@ describe("registerVcsAdapter with junk", () => {
       hunk.registerVcsAdapter({ id: "hg", name: "Mercurial", detect: () => null });
     });
 
-    const applied = applyExtensionRegistrations({
-      ...createEmptyExtensionLoadResult("/repo"),
-      registry,
-    });
+    const applied = applyExtensionRegistrations(
+      {
+        ...createEmptyExtensionLoadResult("/repo"),
+        registry,
+      },
+      BASE_VCS_CATALOG,
+    );
 
     expect(applied.vcsAdapters.map((adapter) => adapter.id)).toEqual(["hg"]);
     expect(applied.issues).toHaveLength(4);
@@ -554,6 +627,7 @@ describe("factories that misbehave outright", () => {
     });
 
     for (const method of [
+      "configureSession",
       "registerTheme",
       "registerFileLanguage",
       "registerVcsAdapter",

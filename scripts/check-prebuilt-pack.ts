@@ -1,8 +1,13 @@
 #!/usr/bin/env bun
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
-import { releaseNpmDir } from "./prebuilt-package-helpers";
+import {
+  assertNoMandatoryBunDependency,
+  assertOptionalPeerDependencyContract,
+  releaseNpmDir,
+  type PackageDependencyManifest,
+} from "./prebuilt-package-helpers";
 import { npmCommand } from "./script-helpers";
 
 interface PackedFile {
@@ -13,6 +18,13 @@ interface PackResult {
   name: string;
   version: string;
   files: PackedFile[];
+}
+
+/** Read one package manifest from disk. */
+function readPackageManifest(directory: string) {
+  return JSON.parse(
+    readFileSync(path.join(directory, "package.json"), "utf8"),
+  ) as PackageDependencyManifest;
 }
 
 function runPackDryRun(cwd: string) {
@@ -62,6 +74,11 @@ const metaDir = path.join(releaseRoot, "hunkdiff");
 if (!existsSync(metaDir)) {
   throw new Error(`Missing staged top-level package at ${metaDir}`);
 }
+
+const rootManifest = readPackageManifest(repoRoot);
+const stagedManifest = readPackageManifest(metaDir);
+assertOptionalPeerDependencyContract(rootManifest, stagedManifest, "@pierre/diffs");
+assertNoMandatoryBunDependency(stagedManifest);
 
 const metaPack = runPackDryRun(metaDir);
 assertPaths(metaPack, [

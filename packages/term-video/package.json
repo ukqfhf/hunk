@@ -18,11 +18,12 @@
       "import": "./src/compose.mjs"
     },
     "./plan": {
+      "types": "./src/plan.d.mts",
       "import": "./src/plan.mjs"
     }
   },
   "engines": {
     "bun": ">=1.0.0",
-    "node": ">=18"
+    "node": ">=22"
   }
 }

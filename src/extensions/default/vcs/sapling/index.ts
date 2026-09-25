@@ -7,18 +7,19 @@ import {
   listSlUntrackedFiles,
   resolveSlRepoRoot,
   runSlText,
-} from "../../../../core/vcs/sapling";
+} from "./commands";
+import { describeDiffRange } from "../diffRange";
 import {
-  HUNK_CORE_VCS_DETECTION_PRIORITY,
+  HUNK_VCS_DETECTION_BASELINE_PRIORITY,
   type ExtensionVcsAdapter,
   type HunkExtensionAPI,
-} from "../../../../extension-api/types";
+} from "hunkdiff/extension";
 
 /**
  * Hunk's Sapling backend, as a bundled extension.
  *
- * Like the Jujutsu one, this file sees only the published contract plus its own
- * helpers in `src/core/vcs/sapling.ts`.
+ * Like the Jujutsu one, this file sees only the published contract plus helpers
+ * owned by this extension directory.
  */
 
 /** Return the last path segment for review titles. */
@@ -72,20 +73,22 @@ export const SaplingVcsAdapter = {
   detect: detectSlRepo,
   // Above Git for the same reason Jujutsu is: `sl init --git` leaves Git
   // metadata behind, and the Sapling working copy is the one under review.
-  detectionPriority: HUNK_CORE_VCS_DETECTION_PRIORITY + 100,
+  detectionPriority: HUNK_VCS_DETECTION_BASELINE_PRIORITY + 100,
   operations: {
     "working-tree-diff": {
       async load(input, { cwd }) {
         if (input.staged) {
           throw createSlStagedError(input);
         }
+        const diffArgs = buildSlDiffArgs(input);
         const repoRoot = resolveSlRepoRoot(input, { cwd });
         const repoName = basename(repoRoot);
+        const range = describeDiffRange(input);
         return {
           repoRoot,
           sourceLabel: repoRoot,
-          title: input.range ? `${repoName} ${input.range}` : `${repoName} working copy`,
-          patchText: runSlText({ input, args: buildSlDiffArgs(input), cwd }),
+          title: range ? `${repoName} ${range}` : `${repoName} working copy`,
+          patchText: runSlText({ input, args: diffArgs, cwd }),
           untrackedPaths: listSlUntrackedFiles(input, { cwd, repoRoot }),
         };
       },

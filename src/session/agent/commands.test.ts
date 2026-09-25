@@ -7,14 +7,14 @@ import {
   createTestSessionReview as buildTestSessionReview,
   createTestSessionSnapshot,
 } from "../../../test/helpers/session-daemon-fixtures";
-import type { SessionCommandInput, SessionSelectorInput } from "../../core/types";
+import type { SessionCommandInput, SessionSelectorInput } from "../../core/run/commandInputs";
 import {
   runSessionCommand,
   setSessionCommandTestHooks,
   type HunkDaemonCliClient,
 } from "./commands";
-import { HUNK_DAEMON_UPGRADE_RESTART_NOTICE } from "../client/capabilities";
 import { HUNK_SESSION_API_VERSION, HUNK_SESSION_DAEMON_VERSION } from "../protocol";
+import { SessionBrokerClientAuthenticationError } from "@hunk/session-broker";
 
 function createTestListedSession(sessionId: string) {
   return buildTestListedSession({
@@ -71,6 +71,8 @@ function createClient(overrides: Partial<HunkDaemonCliClient>): HunkDaemonCliCli
         "comment-list",
         "comment-rm",
         "comment-clear",
+        "highlight-add",
+        "highlight-clear",
       ],
     }),
     listSessions: async () => [],
@@ -121,6 +123,21 @@ function createClient(overrides: Partial<HunkDaemonCliClient>): HunkDaemonCliCli
       removedCount: 0,
       remainingCommentCount: 0,
     }),
+    addHighlight: async () => ({
+      fileId: "file-1",
+      filePath: "README.md",
+      hunkIndex: 0,
+      side: "new",
+      line: 1,
+      start: 0,
+      end: 4,
+      tone: "match",
+      fileMarkCount: 1,
+    }),
+    clearHighlights: async () => ({
+      removedCount: 0,
+      remainingCount: 0,
+    }),
     ...overrides,
   };
 }
@@ -130,233 +147,87 @@ afterEach(() => {
 });
 
 describe("session command compatibility checks", () => {
-  test("refreshes an older daemon without the session API before running context", async () => {
-    const selector: SessionSelectorInput = { sessionId: "session-1" };
-    const restartCalls: Array<{ action: string; selector?: SessionSelectorInput }> = [];
-    const createdClients: string[] = [];
-    const notices: string[] = [];
-    const originalConsoleError = console.error;
-    console.error = (...args: unknown[]) => {
-      notices.push(args.map((value) => String(value)).join(" "));
-    };
+  test("fails promptly without executing an action against an incompatible daemon", async () => {
+    let contextCalls = 0;
+    setSessionCommandTestHooks({
+      createClient: () =>
+        createClient({
+          getCapabilities: async () => null,
+          getSelectedContext: async () => {
+            contextCalls += 1;
+            return createTestSelectedSessionContext();
+          },
+        }),
+      resolveDaemonAvailability: async () => true,
+    });
 
-    const clients = [
-      createClient({
-        getCapabilities: async () => {
-          createdClients.push("stale-capabilities");
-          return null;
-        },
-      }),
-      createClient({
-        getSelectedContext: async (receivedSelector) => {
-          createdClients.push("fresh-context");
-          expect(receivedSelector).toEqual(selector);
-          return createTestSelectedSessionContext();
-        },
-      }),
-    ];
-
-    try {
-      setSessionCommandTestHooks({
-        createClient: () => {
-          const client = clients.shift();
-          if (!client) {
-            throw new Error("No fake session client remaining.");
-          }
-
-          return client;
-        },
-        resolveDaemonAvailability: async () => true,
-        restartDaemonForMissingAction: async (action, receivedSelector) => {
-          restartCalls.push({ action, selector: receivedSelector });
-        },
-      });
-
-      const output = await runSessionCommand({
+    await expect(
+      runSessionCommand({
         kind: "session",
         action: "context",
-        selector,
+        selector: { sessionId: "session-1" },
         output: "json",
-      } satisfies SessionCommandInput);
-
-      expect(JSON.parse(output)).toMatchObject({
-        context: {
-          sessionId: "session-1",
-          selectedFile: {
-            path: "README.md",
-          },
-          selectedHunk: {
-            index: 0,
-          },
-        },
-      });
-      expect(restartCalls).toEqual([
-        {
-          action: "context",
-          selector,
-        },
-      ]);
-      expect(createdClients).toEqual(["stale-capabilities", "fresh-context"]);
-      expect(notices).toContain(HUNK_DAEMON_UPGRADE_RESTART_NOTICE);
-    } finally {
-      console.error = originalConsoleError;
-    }
+      } satisfies SessionCommandInput),
+    ).rejects.toThrow(
+      "Close older Hunk windows, wait for the daemon to become idle, then retry this command.",
+    );
+    expect(contextCalls).toBe(0);
   });
 
-  test("refreshes an incompatible daemon version before running list", async () => {
-    const restartCalls: Array<{ action: string; selector?: SessionSelectorInput }> = [];
-    const createdClients: string[] = [];
-    const notices: string[] = [];
-    const originalConsoleError = console.error;
-    console.error = (...args: unknown[]) => {
-      notices.push(args.map((value) => String(value)).join(" "));
-    };
+  test("maps signed negotiation failure to quiescent upgrade guidance", async () => {
+    setSessionCommandTestHooks({
+      createClient: () =>
+        createClient({
+          getCapabilities: async () => {
+            throw new SessionBrokerClientAuthenticationError();
+          },
+        }),
+      resolveDaemonAvailability: async () => true,
+    });
 
-    const clients = [
-      createClient({
-        getCapabilities: async () => {
-          createdClients.push("stale-capabilities");
-          return {
-            version: HUNK_SESSION_API_VERSION - 1,
+    await expect(
+      runSessionCommand({ kind: "session", action: "list", output: "json" }),
+    ).rejects.toThrow("Close older Hunk windows");
+  });
+
+  test("preserves local credential-store failures", async () => {
+    setSessionCommandTestHooks({
+      createClient: () =>
+        createClient({
+          getCapabilities: async () => {
+            throw new Error("owner-private credential store is unsafe");
+          },
+        }),
+      resolveDaemonAvailability: async () => true,
+    });
+
+    await expect(
+      runSessionCommand({ kind: "session", action: "list", output: "json" }),
+    ).rejects.toThrow("owner-private credential store is unsafe");
+  });
+
+  test("fails promptly when compatible capabilities omit the required action", async () => {
+    let listCalls = 0;
+    setSessionCommandTestHooks({
+      createClient: () =>
+        createClient({
+          getCapabilities: async () => ({
+            version: HUNK_SESSION_API_VERSION,
             daemonVersion: HUNK_SESSION_DAEMON_VERSION,
-            actions: ["list"],
-          };
-        },
-      }),
-      createClient({
-        listSessions: async () => {
-          createdClients.push("fresh-list");
-          return [createTestListedSession("session-1")];
-        },
-      }),
-    ];
-
-    try {
-      setSessionCommandTestHooks({
-        createClient: () => {
-          const client = clients.shift();
-          if (!client) {
-            throw new Error("No fake session client remaining.");
-          }
-
-          return client;
-        },
-        resolveDaemonAvailability: async () => true,
-        restartDaemonForMissingAction: async (action, receivedSelector) => {
-          restartCalls.push({ action, selector: receivedSelector });
-        },
-      });
-
-      const output = await runSessionCommand({
-        kind: "session",
-        action: "list",
-        output: "json",
-      } satisfies SessionCommandInput);
-
-      expect(JSON.parse(output)).toMatchObject({
-        sessions: [
-          {
-            sessionId: "session-1",
+            actions: ["get"],
+          }),
+          listSessions: async () => {
+            listCalls += 1;
+            return [];
           },
-        ],
-      });
-      expect(restartCalls).toEqual([
-        {
-          action: "list",
-          selector: undefined,
-        },
-      ]);
-      expect(createdClients).toEqual(["stale-capabilities", "fresh-list"]);
-      expect(notices).toContain(HUNK_DAEMON_UPGRADE_RESTART_NOTICE);
-    } finally {
-      console.error = originalConsoleError;
-    }
-  });
+        }),
+      resolveDaemonAvailability: async () => true,
+    });
 
-  test("refreshes a stale daemon before running comment-add", async () => {
-    const selector: SessionSelectorInput = { sessionId: "session-1" };
-    const restartCalls: Array<{ action: string; selector?: SessionSelectorInput }> = [];
-    const createdClients: string[] = [];
-    const notices: string[] = [];
-    const originalConsoleError = console.error;
-    console.error = (...args: unknown[]) => {
-      notices.push(args.map((value) => String(value)).join(" "));
-    };
-
-    const clients = [
-      createClient({
-        getCapabilities: async () => {
-          createdClients.push("stale-capabilities");
-          return null;
-        },
-      }),
-      createClient({
-        addComment: async (input) => {
-          createdClients.push("fresh-comment-add");
-          expect(input.selector).toEqual(selector);
-          expect(input.filePath).toBe("README.md");
-          expect(input.side).toBe("new");
-          expect(input.line).toBe(2);
-          expect(input.summary).toBe("Review note");
-          return {
-            commentId: "comment-1",
-            fileId: "file-1",
-            filePath: "README.md",
-            hunkIndex: 0,
-            side: "new",
-            line: 2,
-          };
-        },
-      }),
-    ];
-
-    try {
-      setSessionCommandTestHooks({
-        createClient: () => {
-          const client = clients.shift();
-          if (!client) {
-            throw new Error("No fake session client remaining.");
-          }
-
-          return client;
-        },
-        resolveDaemonAvailability: async () => true,
-        restartDaemonForMissingAction: async (action, receivedSelector) => {
-          restartCalls.push({ action, selector: receivedSelector });
-        },
-      });
-
-      const output = await runSessionCommand({
-        kind: "session",
-        action: "comment-add",
-        selector,
-        filePath: "README.md",
-        side: "new",
-        line: 2,
-        summary: "Review note",
-        reveal: false,
-        output: "json",
-      } satisfies SessionCommandInput);
-
-      expect(JSON.parse(output)).toMatchObject({
-        result: {
-          commentId: "comment-1",
-          filePath: "README.md",
-          side: "new",
-          line: 2,
-        },
-      });
-      expect(restartCalls).toEqual([
-        {
-          action: "comment-add",
-          selector,
-        },
-      ]);
-      expect(createdClients).toEqual(["stale-capabilities", "fresh-comment-add"]);
-      expect(notices).toContain(HUNK_DAEMON_UPGRADE_RESTART_NOTICE);
-    } finally {
-      console.error = originalConsoleError;
-    }
+    await expect(
+      runSessionCommand({ kind: "session", action: "list", output: "json" }),
+    ).rejects.toThrow("missing required support for list");
+    expect(listCalls).toBe(0);
   });
 
   test("runs review commands through the daemon without raw patch text by default", async () => {
@@ -740,7 +611,7 @@ describe("session command compatibility checks", () => {
     });
   });
 
-  test("passes a separate source path through reload commands", async () => {
+  test("forwards structured endpoints and a separate source path through reload commands", async () => {
     setSessionCommandTestHooks({
       createClient: () =>
         createClient({
@@ -752,6 +623,7 @@ describe("session command compatibility checks", () => {
             expect(input.sourcePath).toBe("/source-repo");
             expect(input.nextInput).toEqual({
               kind: "vcs",
+              rangeEndpoints: { from: "main", to: "feature" },
               staged: false,
               options: {},
             });
@@ -777,6 +649,7 @@ describe("session command compatibility checks", () => {
       sourcePath: "/source-repo",
       nextInput: {
         kind: "vcs",
+        rangeEndpoints: { from: "main", to: "feature" },
         staged: false,
         options: {},
       },
@@ -848,9 +721,7 @@ describe("session command compatibility checks", () => {
     );
   });
 
-  test("does not restart when the daemon already exposes the needed session action", async () => {
-    const restartCalls: string[] = [];
-
+  test("runs when the daemon already exposes the needed session action", async () => {
     setSessionCommandTestHooks({
       createClient: () =>
         createClient({
@@ -873,9 +744,6 @@ describe("session command compatibility checks", () => {
           }),
         }),
       resolveDaemonAvailability: async () => true,
-      restartDaemonForMissingAction: async (action) => {
-        restartCalls.push(action);
-      },
     });
 
     const output = await runSessionCommand({
@@ -886,7 +754,6 @@ describe("session command compatibility checks", () => {
     } satisfies SessionCommandInput);
 
     expect(JSON.parse(output)).toEqual({ comments: [] });
-    expect(restartCalls).toEqual([]);
   });
 
   test("normalizes session-path selectors for reload commands before calling the daemon client", async () => {
@@ -1048,6 +915,76 @@ describe("session command compatibility checks", () => {
     ).toBe("Cleared 2 live comments from README.md in session session-1. Remaining comments: 0.\n");
 
     expect(calls).toEqual(["navigate", "comment-list", "comment-rm", "comment-clear"]);
+  });
+
+  test("routes highlight actions through the daemon and formats text output", async () => {
+    const selector: SessionSelectorInput = { sessionId: "session-1" };
+    const calls: string[] = [];
+
+    setSessionCommandTestHooks({
+      createClient: () =>
+        createClient({
+          addHighlight: async (input) => {
+            calls.push("highlight-add");
+            expect(input.selector).toEqual(selector);
+            expect(input.filePath).toBe("README.md");
+            expect(input.side).toBe("new");
+            expect(input.line).toBe(2);
+            expect(input.start).toBe(4);
+            expect(input.end).toBe(11);
+            expect(input.tone).toBe("info");
+            expect(input.reveal).toBe(true);
+            return {
+              fileId: "file-1",
+              filePath: "README.md",
+              hunkIndex: 0,
+              side: "new",
+              line: 2,
+              start: 4,
+              end: 11,
+              tone: "info",
+              fileMarkCount: 1,
+              revealed: "line",
+            };
+          },
+          clearHighlights: async (input) => {
+            calls.push("highlight-clear");
+            expect(input.selector).toEqual(selector);
+            expect(input.filePath).toBeUndefined();
+            return { removedCount: 1, remainingCount: 0 };
+          },
+        }),
+      resolveDaemonAvailability: async () => true,
+    });
+
+    expect(
+      await runSessionCommand({
+        kind: "session",
+        action: "highlight-add",
+        selector,
+        filePath: "README.md",
+        side: "new",
+        line: 2,
+        start: 4,
+        end: 11,
+        tone: "info",
+        reveal: true,
+        output: "text",
+      } satisfies SessionCommandInput),
+    ).toBe(
+      "Marked README.md:2 (new) [4, 11) as info in session session-1 and revealed its line. File marks: 1.\n",
+    );
+
+    expect(
+      await runSessionCommand({
+        kind: "session",
+        action: "highlight-clear",
+        selector,
+        output: "text",
+      } satisfies SessionCommandInput),
+    ).toBe("Cleared 1 attention marks from session session-1. Remaining marks: 0.\n");
+
+    expect(calls).toEqual(["highlight-add", "highlight-clear"]);
   });
 });
 

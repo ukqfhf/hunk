@@ -6,14 +6,14 @@ import {
   type CliReferenceCommand,
   type CliReferenceOption,
   WATCH_OPTION,
-} from "../src/core/cli";
+} from "../src/app/cli";
 import {
   BUILT_IN_THEME_IDS,
   CONFIG_COMMAND_SECTIONS,
   CONFIG_REFERENCE_CUSTOM_THEME,
   CONFIG_REFERENCE_EXTENSIONS,
   CONFIG_REFERENCE_OPTIONS,
-} from "../src/core/config";
+} from "../src/core/run/config";
 import { renderHunkReviewSkill } from "../src/hunk-review/skillDocument";
 import { type AgentCommandOption, SESSION_AGENT_COMMAND_LIST } from "../src/session/agent/surface";
 import {
@@ -130,6 +130,12 @@ export function renderCliReference() {
         renderUsage(command.synopsis),
       ];
 
+      if (command.details && command.details.length > 0) {
+        pieces.push(
+          "",
+          ...command.details.flatMap((detail, index) => (index > 0 ? ["", detail] : [detail])),
+        );
+      }
       if (command.aliases && command.aliases.length > 0) {
         pieces.push(
           "",
@@ -188,11 +194,14 @@ export function renderCliReference() {
         "",
         "**Constraints:** " +
           command.constraints
-            .map((constraint) =>
-              constraint.kind === "exactly-one"
-                ? `exactly one of ${constraint.flags.map((flag) => `\`${flag}\``).join(", ")}`
-                : `at most one of ${constraint.flags.map((flag) => `\`${flag}\``).join(", ")}`,
-            )
+            .map((constraint) => {
+              const scope = constraint.documentationScope
+                ? `${constraint.documentationScope}, `
+                : "";
+              return constraint.kind === "exactly-one"
+                ? `${scope}exactly one of ${constraint.flags.map((flag) => `\`${flag}\``).join(", ")}`
+                : `${scope}at most one of ${constraint.flags.map((flag) => `\`${flag}\``).join(", ")}`;
+            })
             .join("; ") +
           ".",
       );
@@ -276,7 +285,7 @@ description: Exhaustive generated reference for Hunk TOML keys, defaults, aliase
 
 ${GENERATED_NOTICE}
 
-Hunk reads TOML preferences from the user config and an optional repository config. This reference is generated from the same catalog that \`src/core/config.ts\` uses to parse preference keys.
+Hunk reads TOML preferences from the user config and an optional repository config. This reference is generated from the same catalog that \`src/core/run/config.ts\` uses to parse preference keys.
 
 ## Resolution and scope
 

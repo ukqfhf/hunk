@@ -1,5 +1,7 @@
-import { DEFAULT_TAB_WIDTH } from "../../core/tabWidth";
-import type { DiffFile, LayoutMode } from "../../core/types";
+import { DEFAULT_HUNK_GAP } from "../../core/run/reviewGap";
+import { DEFAULT_TAB_WIDTH } from "../../core/run/tabWidth";
+import type { DiffFile } from "../../core/changeset/model";
+import type { LayoutMode } from "../../core/run/commandInputs";
 import { measureAgentInlineNoteHeight } from "../components/panes/AgentInlineNote";
 import type { VisibleAgentNote } from "../lib/agentAnnotations";
 import type { SectionGeometry, VerticalBounds } from "../lib/diffSpatial";
@@ -11,10 +13,10 @@ import { type FileSourceStatus } from "./expandCollapsedRows";
 import {
   plannedReviewRowContributesToHunkBounds,
   type PlannedHunkBounds,
-} from "./plannedReviewRows";
+} from "./reviewRowGeometry";
 import type { PlannedFileViewRow } from "../fileViews/renderPlan";
 import type { PlannedReviewRow } from "./reviewRenderPlan";
-import { measureRenderedRowHeight } from "./renderRows";
+import { measurePlannedRenderedRowHeight } from "./codeRowLayout";
 
 const EMPTY_EXPANDED_GAP_KEYS: ReadonlySet<string> = new Set();
 const EMPTY_VISIBLE_AGENT_NOTES: VisibleAgentNote[] = [];
@@ -62,7 +64,7 @@ function notesCacheKey(visibleAgentNotes: VisibleAgentNote[]) {
   }
 
   return `:notes:${visibleAgentNotes
-    .map(({ annotation }) => {
+    .map(({ annotation, actions, thread }) => {
       const key = JSON.stringify({
         author: annotation.author,
         id: annotation.id,
@@ -72,6 +74,15 @@ function notesCacheKey(visibleAgentNotes: VisibleAgentNote[]) {
         source: annotation.source,
         summary: annotation.summary,
         title: annotation.title,
+        parentId: thread?.parentId,
+        threadDepth: thread?.depth,
+        actions: actions
+          ? {
+              edit: Boolean(actions.onEdit),
+              reply: Boolean(actions.onReply),
+              delete: Boolean(actions.onDelete),
+            }
+          : undefined,
       });
       return `${key.length}:${key}`;
     })
@@ -148,6 +159,7 @@ function createLazyPlannedRowsResolver({
   showHunkHeaders,
   sourceStatus,
   tabWidth,
+  hunkGap,
   theme,
   visibleAgentNotes,
 }: {
@@ -157,6 +169,7 @@ function createLazyPlannedRowsResolver({
   showHunkHeaders: boolean;
   sourceStatus: FileSourceStatus | undefined;
   tabWidth: number;
+  hunkGap: number;
   theme: AppTheme;
   visibleAgentNotes: VisibleAgentNote[];
 }) {
@@ -171,6 +184,7 @@ function createLazyPlannedRowsResolver({
     showHunkHeaders,
     sourceStatus: sourceStatus ? structuredClone(sourceStatus) : undefined,
     tabWidth,
+    hunkGap,
     theme,
     visibleAgentNotes:
       visibleAgentNotes.length === 0
@@ -194,7 +208,6 @@ interface DiffSectionRowHeightOptions {
   showHunkHeaders: boolean;
   showLineNumbers: boolean;
   reserveAddNoteColumn: boolean;
-  theme: AppTheme;
   width: number;
   wrapLines: boolean;
 }
@@ -207,7 +220,6 @@ function buildDiffSectionRowHeightOptions(
     showHunkHeaders,
     showLineNumbers,
     reserveAddNoteColumn,
-    theme,
     width,
     wrapLines,
   }: Omit<DiffSectionRowHeightOptions, "lineNumberDigits">,
@@ -218,7 +230,6 @@ function buildDiffSectionRowHeightOptions(
     showHunkHeaders,
     reserveAddNoteColumn,
     showLineNumbers,
-    theme,
     width,
     wrapLines,
   };
@@ -233,7 +244,6 @@ function measurePlannedDiffSectionRowHeight(
     showHunkHeaders,
     reserveAddNoteColumn,
     showLineNumbers,
-    theme,
     width,
     wrapLines,
   }: DiffSectionRowHeightOptions,
@@ -244,22 +254,26 @@ function measurePlannedDiffSectionRowHeight(
       anchorSide: row.anchorSide,
       layout,
       width,
+      actions: row.note.actions,
+      threadDepth: row.note.thread?.depth,
     });
   }
 
-  return measureRenderedRowHeight(
-    row.row,
-    width,
+  if (row.kind === "hunk-gap") {
+    return row.height;
+  }
+
+  return measurePlannedRenderedRowHeight(row, {
     lineNumberDigits,
-    showLineNumbers,
-    showHunkHeaders,
-    wrapLines,
-    theme,
     reserveAddNoteColumn,
-  );
+    showHunkHeaders,
+    showLineNumbers,
+    width,
+    wrapLines,
+  });
 }
 
-/** Measure one file section from the same render plan used by PierreDiffView. */
+/** Measure one file section from the same render plan used by DiffSectionBody. */
 export function measureDiffSectionGeometry(
   file: DiffFile,
   layout: Exclude<LayoutMode, "auto">,
@@ -273,6 +287,7 @@ export function measureDiffSectionGeometry(
   sourceStatus: FileSourceStatus | undefined = undefined,
   reserveAddNoteColumn = false,
   tabWidth = DEFAULT_TAB_WIDTH,
+  hunkGap = DEFAULT_HUNK_GAP,
 ): DiffSectionGeometry {
   if (file.metadata.hunks.length === 0) {
     return {
@@ -301,7 +316,7 @@ export function measureDiffSectionGeometry(
     theme.lineNumberBg,
     theme.lineNumberFg,
   ].join(":");
-  const cacheKey = `${file.id}:${layout}:${showHunkHeaders ? 1 : 0}:${themeCacheKey}:${width}:${showLineNumbers ? 1 : 0}:${wrapLines ? 1 : 0}:${reserveAddNoteColumn ? 1 : 0}:tabs:${tabWidth}${expansionCacheKey(expandedKeys, sourceStatus)}${notesCacheKey(visibleAgentNotes)}`;
+  const cacheKey = `${file.id}:${layout}:${showHunkHeaders ? 1 : 0}:${themeCacheKey}:${width}:${showLineNumbers ? 1 : 0}:${wrapLines ? 1 : 0}:${reserveAddNoteColumn ? 1 : 0}:tabs:${tabWidth}:hunkGap:${hunkGap}${expansionCacheKey(expandedKeys, sourceStatus)}${notesCacheKey(visibleAgentNotes)}`;
   const cacheSlot = sectionGeometryCacheSlot(visibleAgentNotes);
   const cached = getCachedSectionGeometry(file, cacheSlot, cacheKey);
   if (cached) {
@@ -315,6 +330,7 @@ export function measureDiffSectionGeometry(
     showHunkHeaders,
     sourceStatus,
     tabWidth,
+    hunkGap,
     theme,
     visibleAgentNotes,
   });
@@ -330,7 +346,6 @@ export function measureDiffSectionGeometry(
     showHunkHeaders,
     reserveAddNoteColumn,
     showLineNumbers,
-    theme,
     width,
     wrapLines,
   });
@@ -395,6 +410,7 @@ export function measureDiffSectionGeometry(
     showHunkHeaders,
     sourceStatus,
     tabWidth,
+    hunkGap,
     theme,
     visibleAgentNotes,
   });
@@ -424,24 +440,4 @@ export function estimateDiffSectionBodyRows(
   theme: AppTheme,
 ) {
   return measureDiffSectionGeometry(file, layout, showHunkHeaders, theme).bodyHeight;
-}
-
-/** Estimate the body-row position for the anchor that should represent the selected hunk. */
-export function estimateHunkAnchorBodyRow(
-  file: DiffFile,
-  layout: Exclude<LayoutMode, "auto">,
-  showHunkHeaders: boolean,
-  hunkIndex: number,
-  theme: AppTheme,
-) {
-  if (file.metadata.hunks.length === 0) {
-    return 0;
-  }
-
-  const clampedHunkIndex = Math.max(0, Math.min(hunkIndex, file.metadata.hunks.length - 1));
-  return (
-    measureDiffSectionGeometry(file, layout, showHunkHeaders, theme).hunkAnchorRows.get(
-      clampedHunkIndex,
-    ) ?? 0
-  );
 }

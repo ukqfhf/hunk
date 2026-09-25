@@ -1,6 +1,6 @@
 import { measureAgentInlineNoteHeight } from "../components/panes/AgentInlineNote";
 import { reviewRowId } from "../lib/ids";
-import type { PlannedHunkBounds } from "../diff/plannedReviewRows";
+import type { PlannedHunkBounds } from "../diff/reviewRowGeometry";
 import type { DiffSectionGeometry, DiffSectionRowBounds } from "../diff/diffSectionGeometry";
 import type { ValidatedFileViewLayout } from "./layout";
 import type { PlannedFileViewRow } from "./renderPlan";
@@ -21,6 +21,8 @@ function plannedFileViewRowHeight(
     // Alternate presentations are one full-width stack even when raw code uses split columns.
     layout: "stack",
     width,
+    actions: row.note.actions,
+    threadDepth: row.note.thread?.depth,
   });
 }
 

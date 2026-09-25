@@ -1,10 +1,20 @@
 import type { KeyEvent } from "@opentui/core";
-import { useKeyboard } from "@opentui/react";
+import { useKeyboard, useRenderer } from "@opentui/react";
 import { useRef } from "react";
-import type { ExtensionFileViewModeKeyResult } from "../../extensions/types";
+import type {
+  ExtensionFileViewModeKeyResult,
+  ExtensionKeyboardModeKeyResult,
+  ExtensionKeyEvent,
+} from "../../extensions/types";
 import type { MenuId } from "../components/chrome/menu";
-import { dispatchAppCommand, type AppCommand } from "../lib/appCommands";
+import {
+  dispatchAppCommand,
+  executeAppCommand,
+  type AppCommand,
+  verticalCommandDirection,
+} from "../lib/appCommands";
 import type { ExtensionDialogRequest } from "../lib/extensionDialogs";
+import { toExtensionKeyEvent } from "../lib/extensionKeyEvent";
 import { isEscapeKey, isSaveDraftNoteKey } from "../lib/keyboard";
 import { routeKeyOwnership, type KeyOwner } from "../lib/keyRouting";
 
@@ -41,8 +51,14 @@ export interface UseAppKeyboardShortcutsOptions {
   isFileViewModeActive: () => boolean;
   /** Leave that mode, running its `onExit`. Idempotent. */
   exitFileViewMode: () => void;
-  /** Offer one key to the active mode and report what it decided. */
-  sendFileViewModeKey: (key: KeyEvent) => ExtensionFileViewModeKeyResult;
+  /** Offer one key to the active file-view mode and report what it decided. */
+  sendFileViewModeKey: (key: ExtensionKeyEvent) => ExtensionFileViewModeKeyResult;
+  /** Whether a session-scoped extension keyboard mode currently owns review keys. */
+  isKeyboardModeActive: () => boolean;
+  /** Leave the active session keyboard mode. */
+  exitKeyboardMode: () => void;
+  /** Offer one key to the active session keyboard mode. */
+  sendKeyboardModeKey: (key: ExtensionKeyEvent) => ExtensionKeyboardModeKeyResult;
   focusArea: FocusArea;
   moveMenuItem: (delta: number) => void;
   moveThemeSelector: (delta: number) => void;
@@ -100,6 +116,9 @@ export function useAppKeyboardShortcuts({
   isFileViewModeActive,
   exitFileViewMode,
   sendFileViewModeKey,
+  isKeyboardModeActive,
+  exitKeyboardMode,
+  sendKeyboardModeKey,
   focusArea,
   moveMenuItem,
   moveThemeSelector,
@@ -116,6 +135,7 @@ export function useAppKeyboardShortcuts({
   toggleFocusArea,
   themeSelectorOpen,
 }: UseAppKeyboardShortcutsOptions) {
+  const renderer = useRenderer();
   const activeMenuIdRef = useRef(activeMenuId);
   const commandsRef = useRef(commands);
   const focusAreaRef = useRef(focusArea);
@@ -130,6 +150,9 @@ export function useAppKeyboardShortcuts({
   const isFileViewModeActiveRef = useRef(isFileViewModeActive);
   const exitFileViewModeRef = useRef(exitFileViewMode);
   const sendFileViewModeKeyRef = useRef(sendFileViewModeKey);
+  const isKeyboardModeActiveRef = useRef(isKeyboardModeActive);
+  const exitKeyboardModeRef = useRef(exitKeyboardMode);
+  const sendKeyboardModeKeyRef = useRef(sendKeyboardModeKey);
   // These three close over live dialog state (the highlighted option, the typed
   // text), so they are read through refs rather than captured once.
   const acceptExtensionDialogRef = useRef(acceptExtensionDialog);
@@ -148,6 +171,9 @@ export function useAppKeyboardShortcuts({
   isFileViewModeActiveRef.current = isFileViewModeActive;
   exitFileViewModeRef.current = exitFileViewMode;
   sendFileViewModeKeyRef.current = sendFileViewModeKey;
+  isKeyboardModeActiveRef.current = isKeyboardModeActive;
+  exitKeyboardModeRef.current = exitKeyboardMode;
+  sendKeyboardModeKeyRef.current = sendKeyboardModeKey;
   acceptExtensionDialogRef.current = acceptExtensionDialog;
   cancelExtensionDialogRef.current = cancelExtensionDialog;
   moveExtensionDialogSelectionRef.current = moveExtensionDialogSelection;
@@ -163,6 +189,22 @@ export function useAppKeyboardShortcuts({
   const consumeKey = (key: KeyEvent) => {
     key.preventDefault();
     key.stopPropagation();
+  };
+
+  /**
+   * Move an ordered modal surface through the active review keymap.
+   *
+   * OpenTUI routes keyboard input through this app-level hook rather than modal renderables,
+   * so this is the shared route for every window that presents a vertical selection.
+   */
+  const moveVerticalModalSelection = (key: KeyEvent, move: (delta: number) => void): boolean => {
+    const direction = verticalCommandDirection(commandsRef.current, key);
+    if (direction === undefined) {
+      return false;
+    }
+
+    move(direction);
+    return true;
   };
 
   /** F10 toggles the menu bar, except while a note draft outranks it. */
@@ -302,6 +344,10 @@ export function useAppKeyboardShortcuts({
     }
 
     if (dialog.kind === "select") {
+      if (moveVerticalModalSelection(key, moveExtensionDialogSelectionRef.current)) {
+        return "mine";
+      }
+
       if (key.name === "up") {
         moveExtensionDialogSelectionRef.current(-1);
         return "mine";
@@ -336,6 +382,10 @@ export function useAppKeyboardShortcuts({
 
     if (isEscapeKey(key)) {
       closeThemeSelector();
+      return "mine";
+    }
+
+    if (moveVerticalModalSelection(key, moveThemeSelector)) {
       return "mine";
     }
 
@@ -392,6 +442,10 @@ export function useAppKeyboardShortcuts({
       return "mine";
     }
 
+    if (moveVerticalModalSelection(key, moveMenuItem)) {
+      return "mine";
+    }
+
     if (key.name === "up") {
       moveMenuItem(-1);
       return "mine";
@@ -424,7 +478,11 @@ export function useAppKeyboardShortcuts({
       // Deliberately no modifier check: Shift+Tab toggles focus exactly like
       // Tab, in both its CSI-u and legacy backtab encodings.
       if (key.name === "tab") {
-        toggleFocusArea();
+        // Keep this text-input escape hatch on the named command path so
+        // extensions observe the same semantic action as a Tab from the file list.
+        if (!executeAppCommand(commandsRef.current, "hunk.app.toggleFocusArea")) {
+          toggleFocusArea();
+        }
         return "mine";
       }
 
@@ -434,7 +492,10 @@ export function useAppKeyboardShortcuts({
     }
 
     if (focusAreaRef.current !== "note") {
-      return "notMine";
+      // Extension panes can mount the same OpenTUI editors Hunk uses. The
+      // renderer is the live focus authority for those inputs, which do not
+      // participate in App's host-only focus-area state.
+      return renderer.currentFocusedEditor ? "focused" : "notMine";
     }
 
     if (isEscapeKey(key)) {
@@ -487,7 +548,7 @@ export function useAppKeyboardShortcuts({
       return "mine";
     }
 
-    const result = sendFileViewModeKeyRef.current(key);
+    const result = sendFileViewModeKeyRef.current(toExtensionKeyEvent(key));
     if (result === "pass") {
       return "notMine";
     }
@@ -499,11 +560,40 @@ export function useAppKeyboardShortcuts({
     return "mine";
   };
 
+  /** Route review-level keys through the one active session extension mode. */
+  const handleKeyboardModeShortcut = (key: KeyEvent): KeyOwner => {
+    if (!isKeyboardModeActiveRef.current()) {
+      return "notMine";
+    }
+
+    // The host reserves Escape as a guaranteed way out of third-party routing.
+    if (isEscapeKey(key)) {
+      exitKeyboardModeRef.current();
+      return "mine";
+    }
+
+    const result = sendKeyboardModeKeyRef.current(toExtensionKeyEvent(key));
+    if (result === "pass") return "notMine";
+    if (result === "exit") exitKeyboardModeRef.current();
+    return "mine";
+  };
+
+  /** Dispatch one command shortcut and honor its menu-closing policy. */
+  const dispatchCommandShortcut = (key: KeyEvent) => {
+    // Dispatch consumes on match (preventDefault inside the loop), so a key
+    // that runs a command never doubles as a scroll-box or input key.
+    const matched = dispatchAppCommand(commandsRef.current, key);
+    if (matched?.closesMenu) {
+      closeMenu();
+    }
+    return matched !== undefined;
+  };
+
   useKeyboard((key: KeyEvent) => {
-    // Precedence is the array order: app-critical prompts, extension dialogs,
-    // then menus and overlays, then focused text inputs, then an active file
-    // view mode, and finally the command table below.
-    const owned = routeKeyOwnership(
+    // Route through the active menu first. Its navigation keys stay host-owned,
+    // while an advertised accelerator gets one direct trip to the command table
+    // before focused inputs or extension modes can claim it.
+    const surfaceOwned = routeKeyOwnership(
       [
         handleExtensionTrustPromptShortcut,
         handleSaveConfigPromptShortcut,
@@ -512,21 +602,23 @@ export function useAppKeyboardShortcuts({
         handleDialogShortcut,
         handleThemeSelectorShortcut,
         handleMenuShortcut,
-        handleFocusedInputShortcut,
-        handleFileViewModeShortcut,
       ],
       key,
       consumeKey,
     );
-    if (owned) {
-      return;
-    }
+    if (surfaceOwned) return;
 
-    // Dispatch consumes on match (preventDefault inside the loop), so a key
-    // that runs a command never doubles as a scroll-box or input key.
-    const matched = dispatchAppCommand(commandsRef.current, key);
-    if (matched?.closesMenu) {
-      closeMenu();
-    }
+    if (activeMenuIdRef.current && dispatchCommandShortcut(key)) return;
+
+    // Without an open-menu command match, focused inputs and extension modes
+    // keep their ordinary precedence ahead of the command table.
+    const reviewOwned = routeKeyOwnership(
+      [handleFocusedInputShortcut, handleFileViewModeShortcut, handleKeyboardModeShortcut],
+      key,
+      consumeKey,
+    );
+    if (reviewOwned) return;
+
+    dispatchCommandShortcut(key);
   });
 }

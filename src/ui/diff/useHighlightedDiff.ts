@@ -1,83 +1,42 @@
+import { createHash } from "node:crypto";
 import { useLayoutEffect, useState } from "react";
-import type { DiffFile } from "../../core/types";
+import type { DiffFile } from "../../core/changeset/model";
 import type { AppTheme } from "../themes";
-import { loadHighlightedDiff, type HighlightedDiffCode } from "./pierre";
+import { loadHighlightedDiff, type HighlightedDiffCode } from "./diffRows";
+import { createHighlightedDiffCache } from "./highlightedDiffCache";
 import { syntaxHighlightThemeName } from "./syntaxHighlightTheme";
 
-/**
- * Maximum cached highlight results.
- *
- * Highlighted HAST nodes and their flattened render spans are expensive enough that a whole-review
- * cache can dominate memory while navigating large changesets. Keep a viewport-local working set
- * instead of retaining every file the user has visited in the current review.
- */
-const MAX_CACHE_ENTRIES = 40;
-
-const SHARED_HIGHLIGHTED_DIFF_CACHE = new Map<string, HighlightedDiffCode>();
+const SHARED_HIGHLIGHTED_DIFF_CACHE = createHighlightedDiffCache();
 const SHARED_HIGHLIGHT_PROMISES = new Map<string, Promise<HighlightedDiffCode>>();
+const highlightedContentFingerprints = new WeakMap<
+  DiffFile,
+  { fingerprint: string; metadata: DiffFile["metadata"]; patch: string }
+>();
 const sourceFetcherIds = new WeakMap<NonNullable<DiffFile["sourceFetcher"]>, number>();
 let nextSourceFetcherId = 1;
 
-/** Evict the oldest entries when the cache exceeds MAX_CACHE_ENTRIES.
- *  Map iteration order is insertion order, so the first keys are the oldest. */
-function enforceCacheLimit() {
-  while (SHARED_HIGHLIGHTED_DIFF_CACHE.size > MAX_CACHE_ENTRIES) {
-    const oldest = SHARED_HIGHLIGHTED_DIFF_CACHE.keys().next().value;
-    if (oldest !== undefined) {
-      SHARED_HIGHLIGHTED_DIFF_CACHE.delete(oldest);
-    }
-  }
-}
-
-/** Summarize rendered diff lines without serializing whole arrays into the cache key. */
-function lineSetFingerprint(lines: string[] | undefined) {
-  let totalChars = 0;
-  let hash = 2166136261;
-
-  for (const line of lines ?? []) {
-    totalChars += line.length;
-
-    for (let index = 0; index < line.length; index += 1) {
-      hash ^= line.charCodeAt(index);
-      hash = Math.imul(hash, 16777619);
-    }
-
-    hash ^= 10;
-    hash = Math.imul(hash, 16777619);
+/** Hash every diff-content input that can change the rendered highlight result. */
+function highlightedContentFingerprint(file: DiffFile) {
+  const cached = highlightedContentFingerprints.get(file);
+  if (cached?.metadata === file.metadata && cached.patch === file.patch) {
+    return cached.fingerprint;
   }
 
-  return `${lines?.length ?? 0}:${totalChars}:${(hash >>> 0).toString(36)}`;
-}
-
-/** Build a fallback fingerprint from parsed metadata when raw patch text is unavailable. */
-function metadataFingerprint(file: DiffFile) {
-  const hunkSummary = file.metadata.hunks
-    .map(
-      (hunk) =>
-        `${hunk.hunkSpecs ?? ""}:${hunk.deletionStart}:${hunk.deletionCount}:${hunk.additionStart}:${hunk.additionCount}:${hunk.hunkContent.length}`,
-    )
-    .join("|");
-
-  return [
-    file.metadata.name,
-    file.metadata.prevName ?? "",
-    file.metadata.type,
-    lineSetFingerprint(file.metadata.deletionLines),
-    lineSetFingerprint(file.metadata.additionLines),
-    hunkSummary,
-  ].join(":");
-}
-
-/** Content fingerprint from the diff patch. Changes whenever the underlying diff
- *  changes, allowing per-file cache invalidation without a global flush. */
-function patchFingerprint(file: DiffFile) {
-  const { patch } = file;
-  if (patch.length === 0) {
-    return metadataFingerprint(file);
-  }
-
-  const mid = Math.floor(patch.length / 2);
-  return `${patch.length}:${patch.slice(0, 64)}:${patch.slice(mid, mid + 64)}:${patch.slice(-64)}`;
+  const metadata = JSON.stringify(file.metadata);
+  const fingerprint = createHash("sha256")
+    .update(`${file.patch.length}:`)
+    .update(file.patch)
+    .update(`${metadata.length}:`)
+    .update(metadata)
+    .digest("hex");
+  // Review reloads replace DiffFile snapshots rather than mutating them, so object identity safely
+  // avoids rehashing large patches during every render and viewport-prefetch pass.
+  highlightedContentFingerprints.set(file, {
+    fingerprint,
+    metadata: file.metadata,
+    patch: file.patch,
+  });
+  return fingerprint;
 }
 
 /** Identify the source snapshot provider used to recover grammar state for a partial diff. */
@@ -100,13 +59,17 @@ function sourceFetcherFingerprint(file: DiffFile) {
   return `source:${id}`;
 }
 
-/** Cache key that includes patch and source-provider identity so reloads cannot reuse stale grammar state. */
+/** Cache key that includes every content and source-provider input to highlighted rendering. */
 export function highlightedDiffCacheKey(theme: AppTheme, file: DiffFile) {
-  return `${theme.id}:${syntaxHighlightThemeName(theme)}:${file.id}:${patchFingerprint(file)}:${sourceFetcherFingerprint(file)}`;
+  return `${theme.id}:${syntaxHighlightThemeName(theme)}:${file.id}:${file.language ?? "text"}:${highlightedContentFingerprint(file)}:${sourceFetcherFingerprint(file)}`;
 }
 
-/** Only commit a highlight result if the promise is still the active one for that key.
- *  Prevents a superseded or late-resolving promise from overwriting a newer entry. */
+/**
+ * Commit one cacheable highlight result if its promise is still active for that key.
+ *
+ * A transient worker failure resolves to plain rows with `retryable`, which updates the current
+ * view but must not occupy the shared cache and prevent a later worker retry.
+ */
 function commitHighlightResult(
   cacheKey: string,
   promise: Promise<HighlightedDiffCode>,
@@ -117,8 +80,9 @@ function commitHighlightResult(
   }
 
   SHARED_HIGHLIGHT_PROMISES.delete(cacheKey);
-  SHARED_HIGHLIGHTED_DIFF_CACHE.set(cacheKey, result);
-  enforceCacheLimit();
+  if (!result.retryable) {
+    SHARED_HIGHLIGHTED_DIFF_CACHE.set(cacheKey, result);
+  }
   return true;
 }
 
@@ -126,8 +90,12 @@ function commitHighlightResult(
 function ensureHighlightedDiffLoaded(
   file: DiffFile,
   theme: AppTheme,
+  offloadLargeDiff: boolean,
   cacheKey = highlightedDiffCacheKey(theme, file),
 ) {
+  // Viewport prefetch calls this for every file in its halo on each scroll, so this read is also
+  // what keeps the files around the viewport at the recent end of the cache while files entering
+  // the halo evict older ones.
   const cached = SHARED_HIGHLIGHTED_DIFF_CACHE.get(cacheKey);
   if (cached) {
     return Promise.resolve(cached);
@@ -139,7 +107,7 @@ function ensureHighlightedDiffLoaded(
   }
 
   let pending: Promise<HighlightedDiffCode>;
-  pending = loadHighlightedDiff(file, theme)
+  pending = loadHighlightedDiff(file, theme, { offloadLargeDiff })
     .then((nextHighlighted) => {
       commitHighlightResult(cacheKey, pending, nextHighlighted);
       return nextHighlighted;
@@ -158,8 +126,16 @@ function ensureHighlightedDiffLoaded(
 }
 
 /** Queue syntax highlighting for one file without mounting its diff rows first. */
-export function prefetchHighlightedDiff({ file, theme }: { file: DiffFile; theme: AppTheme }) {
-  return ensureHighlightedDiffLoaded(file, theme);
+export function prefetchHighlightedDiff({
+  file,
+  offloadLargeDiff = false,
+  theme,
+}: {
+  file: DiffFile;
+  offloadLargeDiff?: boolean;
+  theme: AppTheme;
+}) {
+  return ensureHighlightedDiffLoaded(file, theme, offloadLargeDiff);
 }
 
 /** Read the best already-available highlight result without starting async work during render. */
@@ -180,16 +156,20 @@ function resolveHighlightedSnapshot({
     return highlighted;
   }
 
-  return SHARED_HIGHLIGHTED_DIFF_CACHE.get(appearanceCacheKey) ?? null;
+  // Peek rather than read: render stays side-effect free, and the layout effect below refreshes
+  // recency for this same key during commit.
+  return SHARED_HIGHLIGHTED_DIFF_CACHE.peek(appearanceCacheKey) ?? null;
 }
 
 /** Resolve highlighted diff content with shared caching and background prefetch support. */
 export function useHighlightedDiff({
   file,
+  offloadLargeDiff = false,
   theme,
   shouldLoadHighlight,
 }: {
   file: DiffFile | undefined;
+  offloadLargeDiff?: boolean;
   theme: AppTheme;
   shouldLoadHighlight?: boolean;
 }) {
@@ -224,19 +204,21 @@ export function useHighlightedDiff({
     let cancelled = false;
     setHighlighted(null);
 
-    ensureHighlightedDiffLoaded(file, theme, appearanceCacheKey).then((nextHighlighted) => {
-      if (cancelled) {
-        return;
-      }
+    ensureHighlightedDiffLoaded(file, theme, offloadLargeDiff, appearanceCacheKey).then(
+      (nextHighlighted) => {
+        if (cancelled) {
+          return;
+        }
 
-      setHighlighted(nextHighlighted);
-      setHighlightedCacheKey(appearanceCacheKey);
-    });
+        setHighlighted(nextHighlighted);
+        setHighlightedCacheKey(appearanceCacheKey);
+      },
+    );
 
     return () => {
       cancelled = true;
     };
-  }, [appearanceCacheKey, file, highlightedCacheKey, shouldLoadHighlight]);
+  }, [appearanceCacheKey, file, highlightedCacheKey, offloadLargeDiff, shouldLoadHighlight]);
 
   // Prefer cached highlights during render so revisiting a file can paint immediately.
   return resolveHighlightedSnapshot({

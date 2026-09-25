@@ -2,7 +2,8 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createPtyHarness, lineIndexOf, rowCellBackgrounds } from "./harness";
+import { availableThemes } from "../../src/ui/themes";
+import { createPtyHarness, lineIndexOf, rowCellBackgrounds, sleep } from "./harness";
 
 const harness = createPtyHarness();
 
@@ -19,6 +20,7 @@ describe("PTY chrome", () => {
     const session = await harness.launchHunk({
       args: [
         "diff",
+        "--files",
         fixture.before,
         fixture.after,
         "--mode",
@@ -44,10 +46,12 @@ describe("PTY chrome", () => {
       expect(themeSelector).toContain("Theme selector");
 
       await session.click(/github-light-default/);
-      await session.press("enter");
       const themeSelected = await harness.waitForSnapshot(
         session,
-        (text) => text.includes("Adds bonus export.") && !text.includes("Theme selector"),
+        (text) =>
+          text.includes("Adds bonus export.") &&
+          text.includes("Theme: github-light-default") &&
+          !text.includes("Theme selector"),
         5_000,
       );
       expect(themeSelected).toContain("Adds bonus export.");
@@ -80,13 +84,47 @@ describe("PTY chrome", () => {
     }
   });
 
+  test("rapid theme preview key repeats keep the selector responsive", async () => {
+    const initialThemeId = "github-dark-default";
+    const themes = availableThemes();
+    const fixture = harness.createRapidThemePreviewTestRepoFixture();
+    const session = await harness.launchHunk({
+      args: ["diff", "--theme", initialThemeId],
+      cwd: fixture.dir,
+      cols: 120,
+      rows: 24,
+    });
+
+    try {
+      await session.waitForText(/View\s+Navigate\s+Agent\s+Help/, { timeout: 15_000 });
+      await session.press("t");
+      await session.waitForText(/Theme selector/, { timeout: 5_000 });
+
+      // OS key repeat arrives as a rapid stream while React/OpenTUI drains each preview render.
+      for (let index = 0; index < 100; index += 1) {
+        session.writeRaw("j");
+        await sleep(30);
+      }
+      await session.waitIdle({ timeout: 800 });
+      const selector = await session.text({ immediate: true });
+
+      expect(selector).not.toContain("Maximum update depth exceeded");
+      expect(selector).toContain("Theme selector");
+      const selectedIndex = themes.findIndex((theme) => selector.includes(`›  ${theme.id}`));
+      expect(selectedIndex).toBeGreaterThanOrEqual(0);
+      expect(themes[selectedIndex]?.id).not.toBe(initialThemeId);
+    } finally {
+      session.close();
+    }
+  });
+
   test("quit prompt shows the config diff and saves preferences on mouse click", async () => {
     // Own both config scopes so the test can assert what the save action wrote without an
     // ambient repository `.hunk/config.toml` changing the starting preferences.
     const configHome = mkdtempSync(join(tmpdir(), "hunk-tuistory-save-view-"));
     const fixture = harness.createMultiHunkFilePair();
     const session = await harness.launchHunk({
-      args: ["diff", fixture.before, fixture.after],
+      args: ["diff", "--files", fixture.before, fixture.after],
       cwd: fixture.dir,
       cols: 120,
       rows: 24,

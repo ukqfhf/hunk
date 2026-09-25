@@ -9,7 +9,7 @@ import {
   createTestSessionReviewHunk,
   createTestSessionSnapshot,
 } from "../../../test/helpers/session-daemon-fixtures";
-import type { SessionSelectorInput } from "../../core/types";
+import type { SessionSelectorInput } from "../../core/run/commandInputs";
 import {
   HUNK_SESSION_API_PATH,
   HUNK_SESSION_API_VERSION,
@@ -18,10 +18,12 @@ import {
 import {
   createHttpHunkSessionCliClient,
   formatClearCommentsOutput,
+  formatClearHighlightsOutput,
   formatCommentApplyOutput,
   formatCommentListOutput,
   formatCommentOutput,
   formatContextOutput,
+  formatHighlightOutput,
   formatListOutput,
   formatNavigationOutput,
   formatReloadOutput,
@@ -32,6 +34,9 @@ import {
 
 const selector = { sessionId: "session-1" } satisfies SessionSelectorInput;
 const originalFetch = globalThis.fetch;
+const injectedCaller = {
+  request: (path: string, init?: RequestInit) => globalThis.fetch(path, init),
+};
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -91,6 +96,27 @@ describe("HTTP Hunk session CLI client", () => {
           filePath: "src/app.ts",
         },
       },
+      "highlight-add": {
+        result: {
+          fileId: "file-1",
+          filePath: "src/app.ts",
+          hunkIndex: 0,
+          side: "new" as const,
+          line: 12,
+          start: 2,
+          end: 9,
+          tone: "warning" as const,
+          fileMarkCount: 1,
+          revealed: "line" as const,
+        },
+      },
+      "highlight-clear": {
+        result: {
+          removedCount: 2,
+          remainingCount: 0,
+          filePath: "src/app.ts",
+        },
+      },
     };
 
     globalThis.fetch = (async (input, init) => {
@@ -111,7 +137,7 @@ describe("HTTP Hunk session CLI client", () => {
       return Response.json(responses[request.action as keyof typeof responses]);
     }) as typeof fetch;
 
-    const client = createHttpHunkSessionCliClient();
+    const client = createHttpHunkSessionCliClient({ caller: injectedCaller });
 
     expect(await client.getCapabilities()).toMatchObject({ version: HUNK_SESSION_API_VERSION });
     expect(await client.listSessions()).toEqual([session]);
@@ -136,6 +162,15 @@ describe("HTTP Hunk session CLI client", () => {
         side: "new",
         line: 12,
         commentDirection: "next",
+        output: "json",
+      }),
+    ).toEqual({ fileId: "file-1", filePath: "src/app.ts", hunkIndex: 1 });
+    expect(
+      await client.navigateToHunk({
+        kind: "session",
+        action: "navigate",
+        selector,
+        commentId: "comment-1",
         output: "json",
       }),
     ).toEqual({ fileId: "file-1", filePath: "src/app.ts", hunkIndex: 1 });
@@ -202,6 +237,30 @@ describe("HTTP Hunk session CLI client", () => {
         output: "json",
       }),
     ).toMatchObject({ removedCount: 1 });
+    expect(
+      await client.addHighlight({
+        kind: "session",
+        action: "highlight-add",
+        selector,
+        filePath: "src/app.ts",
+        side: "new",
+        line: 12,
+        start: 2,
+        end: 9,
+        tone: "warning",
+        reveal: true,
+        output: "json",
+      }),
+    ).toMatchObject({ fileMarkCount: 1, revealed: "line" });
+    expect(
+      await client.clearHighlights({
+        kind: "session",
+        action: "highlight-clear",
+        selector,
+        filePath: "src/app.ts",
+        output: "json",
+      }),
+    ).toMatchObject({ removedCount: 2 });
 
     expect(requests).toEqual([
       { action: "list" },
@@ -216,6 +275,11 @@ describe("HTTP Hunk session CLI client", () => {
         side: "new",
         line: 12,
         commentDirection: "next",
+      },
+      {
+        action: "navigate",
+        selector,
+        commentId: "comment-1",
       },
       {
         action: "reload",
@@ -243,6 +307,18 @@ describe("HTTP Hunk session CLI client", () => {
       { action: "comment-list", selector, filePath: "src/app.ts" },
       { action: "comment-rm", selector, commentId: "comment-1" },
       { action: "comment-clear", selector, filePath: "src/app.ts" },
+      {
+        action: "highlight-add",
+        selector,
+        filePath: "src/app.ts",
+        side: "new",
+        line: 12,
+        start: 2,
+        end: 9,
+        tone: "warning",
+        reveal: true,
+      },
+      { action: "highlight-clear", selector, filePath: "src/app.ts" },
     ]);
   });
 
@@ -254,11 +330,39 @@ describe("HTTP Hunk session CLI client", () => {
       });
     }) as typeof fetch;
 
-    const client = createHttpHunkSessionCliClient({ timeoutMs: 10 });
+    const client = createHttpHunkSessionCliClient({ timeoutMs: 10, caller: injectedCaller });
 
     await expect(client.listSessions()).rejects.toThrow(
       "Timed out waiting for the Hunk session daemon to complete session list.",
     );
+  });
+
+  test("rejects malformed successful responses instead of returning asserted types", async () => {
+    globalThis.fetch = (async () =>
+      Response.json({
+        sessions: [{ sessionId: "partial", unknown: true }],
+      })) as unknown as typeof fetch;
+
+    const client = createHttpHunkSessionCliClient({ caller: injectedCaller });
+    await expect(client.listSessions()).rejects.toThrow(
+      "Invalid Hunk session daemon response for list.",
+    );
+
+    globalThis.fetch = (async () => new Response("not json")) as unknown as typeof fetch;
+    await expect(client.listSessions()).rejects.toThrow(
+      "Invalid Hunk session daemon response for list.",
+    );
+  });
+
+  test("returns schema-transformed response objects", async () => {
+    const session = createTestListedSession();
+    globalThis.fetch = (async () =>
+      Response.json({ sessions: [session] })) as unknown as typeof fetch;
+
+    const client = createHttpHunkSessionCliClient({ caller: injectedCaller });
+    const result = await client.listSessions();
+    expect(result).toEqual([session]);
+    expect(result[0]).not.toBe(session);
   });
 
   test("throws daemon response errors with JSON messages or status text fallbacks", async () => {
@@ -268,7 +372,7 @@ describe("HTTP Hunk session CLI client", () => {
         { status: 404, statusText: "Not Found" },
       )) as unknown as typeof fetch;
 
-    const client = createHttpHunkSessionCliClient();
+    const client = createHttpHunkSessionCliClient({ caller: injectedCaller });
     await expect(client.listSessions()).rejects.toThrow("No matching session.");
 
     globalThis.fetch = (async () =>
@@ -575,5 +679,73 @@ describe("Hunk session CLI formatters", () => {
         remainingCommentCount: 0,
       }),
     ).toBe("Cleared 5 live comments from session session-1. Remaining comments: 0.\n");
+  });
+
+  test("highlight formatters describe marks, reveals, and line-exact navigation", () => {
+    expect(
+      formatNavigationOutput(selector, {
+        fileId: "file-1",
+        filePath: "src/app.ts",
+        hunkIndex: 1,
+        revealed: "line",
+        side: "new",
+        line: 42,
+      }),
+    ).toBe("Revealed src/app.ts:42 (new) in hunk 2 of session session-1.\n");
+    // A hunk fallback reads as the classic focus message, not a false line claim.
+    expect(
+      formatNavigationOutput(selector, {
+        fileId: "file-1",
+        filePath: "src/app.ts",
+        hunkIndex: 1,
+        revealed: "hunk",
+        side: "new",
+        line: 42,
+      }),
+    ).toBe("Focused src/app.ts hunk 2 in session session-1.\n");
+
+    expect(
+      formatHighlightOutput(selector, {
+        fileId: "file-1",
+        filePath: "src/app.ts",
+        hunkIndex: 0,
+        side: "new",
+        line: 12,
+        start: 2,
+        end: 9,
+        tone: "warning",
+        fileMarkCount: 3,
+        revealed: "line",
+      }),
+    ).toBe(
+      "Marked src/app.ts:12 (new) [2, 9) as warning in session session-1 and revealed its line. File marks: 3.\n",
+    );
+    expect(
+      formatHighlightOutput(selector, {
+        fileId: "file-1",
+        filePath: "src/app.ts",
+        hunkIndex: 0,
+        side: "old",
+        line: 7,
+        start: 0,
+        end: 4,
+        tone: "match",
+        fileMarkCount: 1,
+      }),
+    ).toBe("Marked src/app.ts:7 (old) [0, 4) as match in session session-1. File marks: 1.\n");
+
+    expect(
+      formatClearHighlightsOutput(selector, {
+        removedCount: 2,
+        remainingCount: 1,
+        filePath: "src/app.ts",
+      }),
+    ).toBe("Cleared 2 attention marks from src/app.ts in session session-1. Remaining marks: 1.\n");
+    expect(
+      formatClearHighlightsOutput(selector, {
+        removedCount: 4,
+        remainingCount: 0,
+      }),
+    ).toBe("Cleared 4 attention marks from session session-1. Remaining marks: 0.\n");
   });
 });

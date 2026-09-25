@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { createEmptyExtensionLoadResult } from "../extensions/types";
-import type { HunkConfigResolution } from "../core/config";
-import { HunkUserError } from "../core/errors";
+import { resolveExtensionCliCommands } from "../extensions/cliCommands";
+import type { HunkConfigResolution } from "../core/run/config";
+import { HunkUserError } from "../core/run/errors";
 import { prepareStartupPlan } from "./startup";
-import type { AppBootstrap, CliInput, NamedCustomThemeConfig, ParsedCliInput } from "../core/types";
+import type { AppBootstrap } from "../core/bootstrap";
+import type { CliInput, ParsedCliInput } from "../core/run/commandInputs";
+import type { NamedCustomThemeConfig } from "../extension-api/types";
 
 /**
  * Build a config resolution for tests that are not exercising config layering.
@@ -39,6 +42,149 @@ function createBootstrap(input: CliInput): AppBootstrap {
 }
 
 describe("startup planning", () => {
+  test("runs an extension CLI command and retires its registry before returning", async () => {
+    const invocation = {
+      kind: "extension-cli" as const,
+      commandName: "tools",
+      args: ["status"],
+      extensionPaths: ["/tools.ts"],
+      extensionsEnabled: true,
+    };
+    const extensions = createEmptyExtensionLoadResult();
+    let shutdowns = 0;
+    extensions.registry.extensions.push({ id: "tools", sourcePath: "/tools.ts", origin: "flag" });
+    extensions.registry.cliCommands.push({
+      extensionId: "tools",
+      command: { name: "tools", summary: "Tools" },
+      handler: (args) => {
+        expect(args).toEqual(["status"]);
+        return { kind: "exit", code: 6 };
+      },
+    });
+    extensions.registry.eventHandlers.shutdown.push({
+      extensionId: "tools",
+      handler: () => {
+        shutdowns += 1;
+      },
+    });
+
+    const plan = await prepareStartupPlan(["bun", "hunk", "tools", "status"], {
+      parseCliImpl: async () => invocation,
+      resolveExtensionCliBootstrapImpl: async ({ baseVcsCatalog }) => ({
+        configured: {
+          extensions: { enabled: true, paths: [], repoPaths: [], extensionConfigs: {} },
+        },
+        extensions,
+        commands: resolveExtensionCliCommands(extensions.registry),
+        collisionIssues: [],
+        discoveryCatalog: baseVcsCatalog,
+      }),
+    });
+
+    expect(plan).toEqual({ kind: "extension-cli-exit", exitCode: 6 });
+    expect(shutdowns).toBe(1);
+  });
+
+  test("delegates once to a built-in headless plan and retires before returning", async () => {
+    const invocation = {
+      kind: "extension-cli" as const,
+      commandName: "tools",
+      args: [],
+      extensionPaths: ["/tools.ts"],
+      extensionsEnabled: true,
+    };
+    const extensions = createEmptyExtensionLoadResult();
+    let shutdowns = 0;
+    extensions.registry.extensions.push({ id: "tools", sourcePath: "/tools.ts", origin: "flag" });
+    extensions.registry.cliCommands.push({
+      extensionId: "tools",
+      command: { name: "tools", summary: "Tools" },
+      handler: () => ({ kind: "delegate", argv: ["--version"] }),
+    });
+    extensions.registry.eventHandlers.shutdown.push({
+      extensionId: "tools",
+      handler: () => {
+        shutdowns += 1;
+      },
+    });
+
+    const plan = await prepareStartupPlan(["bun", "hunk", "tools"], {
+      parseCliImpl: async (argv) =>
+        argv.includes("--version") ? { kind: "help", text: "1.2.3\n" } : invocation,
+      resolveExtensionCliBootstrapImpl: async ({ baseVcsCatalog }) => ({
+        configured: {
+          extensions: { enabled: true, paths: [], repoPaths: [], extensionConfigs: {} },
+        },
+        extensions,
+        commands: resolveExtensionCliCommands(extensions.registry),
+        collisionIssues: [],
+        discoveryCatalog: baseVcsCatalog,
+      }),
+    });
+
+    expect(plan).toEqual({ kind: "help", text: "1.2.3\n" });
+    expect(shutdowns).toBe(1);
+  });
+
+  test("lists the loaded extension commands when the requested token is unclaimed", async () => {
+    const invocation = {
+      kind: "extension-cli" as const,
+      commandName: "toolz",
+      args: [],
+      extensionPaths: ["/tools.ts"],
+      extensionsEnabled: true,
+    };
+    const extensions = createEmptyExtensionLoadResult();
+    extensions.registry.extensions.push({ id: "tools", sourcePath: "/tools.ts", origin: "flag" });
+    extensions.registry.cliCommands.push({
+      extensionId: "tools",
+      command: { name: "tools", summary: "Demonstrate workflows", usage: "<status|review>" },
+      handler: () => ({ kind: "exit" }),
+    });
+
+    const plan = prepareStartupPlan(["bun", "hunk", "toolz"], {
+      parseCliImpl: async () => invocation,
+      resolveExtensionCliBootstrapImpl: async ({ baseVcsCatalog }) => ({
+        configured: {
+          extensions: { enabled: true, paths: [], repoPaths: [], extensionConfigs: {} },
+        },
+        extensions,
+        commands: resolveExtensionCliCommands(extensions.registry),
+        collisionIssues: [],
+        discoveryCatalog: baseVcsCatalog,
+      }),
+    });
+
+    await expect(plan).rejects.toMatchObject({
+      message: "Unknown command: toolz",
+      suggestions: [
+        "Extension commands available here:",
+        "hunk tools <status|review> — Demonstrate workflows",
+      ],
+    });
+  });
+
+  test("rejects a disabled extension command before bootstrap resolution", async () => {
+    let resolved = false;
+
+    await expect(
+      prepareStartupPlan(["bun", "hunk", "--no-extensions", "tools"], {
+        parseCliImpl: async () => ({
+          kind: "extension-cli",
+          commandName: "tools",
+          args: [],
+          extensionPaths: [],
+          extensionsEnabled: false,
+        }),
+        resolveExtensionCliBootstrapImpl: async () => {
+          resolved = true;
+          throw new Error("must not resolve");
+        },
+      }),
+    ).rejects.toThrow("Unknown command: tools");
+    expect(resolved).toBe(false);
+  });
+
   test("returns help output without entering app startup", async () => {
     let loaded = false;
 
@@ -336,7 +482,8 @@ describe("startup planning", () => {
       resolveConfiguredCliInputImpl: (input) => createTestConfigResolution(input, { customThemes }),
       loadAppBootstrapImpl: async (input, options) => {
         expect(input).toBe(cliInput);
-        expect(options).toEqual({ customThemes, vcsAdapters: [] });
+        expect(options).toMatchObject({ customThemes });
+        expect(options?.vcsCatalog?.defaultAdapterId).toBe("git");
         return {
           ...createBootstrap(input),
           customThemes,
@@ -370,6 +517,37 @@ describe("startup planning", () => {
     if (plan.kind === "app") {
       expect(plan.bootstrap.startupNotices).toEqual([startupNotice]);
     }
+  });
+
+  test("rejects watch mode before affected Bun runtimes can deadlock", async () => {
+    const cliInput: CliInput = {
+      kind: "vcs",
+      staged: false,
+      options: { watch: true },
+    };
+    let loaded = false;
+    let opened = false;
+
+    await expect(
+      prepareStartupPlan(["bun", "hunk", "diff", "--watch"], {
+        bunVersion: "1.3.10",
+        parseCliImpl: async () => cliInput as ParsedCliInput,
+        resolveRuntimeCliInputImpl: (input) => input,
+        resolveConfiguredCliInputImpl: (input) => createTestConfigResolution(input),
+        loadAppBootstrapImpl: async (input) => {
+          loaded = true;
+          return createBootstrap(input);
+        },
+        openControllingTerminalImpl: () => {
+          opened = true;
+          return { stdin: {} as never, close: () => {} };
+        },
+        stdinIsTTY: false,
+        stdoutIsTTY: true,
+      }),
+    ).rejects.toThrow("can deadlock while closing filesystem watchers");
+    expect(loaded).toBe(false);
+    expect(opened).toBe(false);
   });
 
   test("rejects watch mode for stdin-backed patch inputs", async () => {

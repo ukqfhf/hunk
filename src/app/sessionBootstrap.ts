@@ -1,7 +1,16 @@
-import type { HunkConfigResolution } from "../core/config";
-import { collectSessionCustomThemes } from "../core/customThemes";
-import { loadAppBootstrap } from "../core/loaders";
-import type { AppBootstrap, CliInput } from "../core/types";
+import {
+  fileLanguageRegistrationSnapshot,
+  restoreFileLanguageRegistrations,
+  type FileLanguageRegistrationSnapshot,
+} from "../core/changeset/fileLanguage";
+import type { HunkConfigResolution } from "../core/run/config";
+import { isVcsReviewInput } from "../core/vcs";
+import type { VcsCatalog } from "../core/vcs/types";
+import { getBundledVcsCatalog } from "./vcsCatalog";
+import { collectSessionCustomThemes } from "../core/theme/customThemes";
+import { loadAppBootstrap } from "../core/changeset/loaders";
+import type { CliInput } from "../core/run/commandInputs";
+import type { AppBootstrap } from "./types";
 import {
   applyExtensionChangesetTransforms,
   applyExtensionRegistrations,
@@ -19,11 +28,15 @@ export interface SessionBootstrapOptions {
   /** Reloads can reopen another directory; initial launch relies on the loader's default cwd. */
   loadAtCwd?: boolean;
   loadAppBootstrapImpl?: typeof loadAppBootstrap;
+  /** Base product adapters composed before user extensions are applied. */
+  baseVcsCatalog?: VcsCatalog;
 }
 
 export interface SessionBootstrapResult {
   applied: AppliedExtensionRegistrations;
   bootstrap: AppBootstrap;
+  /** Selector set to restore if a live reload fails before its commit gate. */
+  previousFileLanguages: FileLanguageRegistrationSnapshot;
   input: CliInput;
   sessionThemes: ReturnType<typeof collectSessionCustomThemes>;
   sessionVcs: ReturnType<typeof resolveSessionVcsId>;
@@ -43,38 +56,44 @@ export async function loadConfiguredSessionBootstrap({
   initialThemeMode,
   loadAtCwd = false,
   loadAppBootstrapImpl = loadAppBootstrap,
+  baseVcsCatalog = getBundledVcsCatalog(),
 }: SessionBootstrapOptions): Promise<SessionBootstrapResult> {
-  const sessionThemes = collectSessionCustomThemes(
-    configured.customThemes,
-    extensions?.registry.themes,
-  );
-  const applied = applyExtensionRegistrations(extensions);
-  const sessionVcs = resolveSessionVcsId(configured.input.options.vcs, cwd, applied.vcsAdapters);
-  let input = configured.input;
+  const previousFileLanguages = fileLanguageRegistrationSnapshot();
 
-  if (sessionVcs.vcsId !== input.options.vcs) {
-    input = { ...input, options: { ...input.options, vcs: sessionVcs.vcsId } };
+  try {
+    const sessionThemes = collectSessionCustomThemes(
+      configured.customThemes,
+      extensions?.registry.themes,
+    );
+    const applied = applyExtensionRegistrations(extensions, baseVcsCatalog);
+    const sessionVcs = resolveSessionVcsId(configured.input.options.vcs, cwd, applied.vcsCatalog);
+    let input = configured.input;
+
+    if (sessionVcs.vcsId !== input.options.vcs) {
+      input = { ...input, options: { ...input.options, vcs: sessionVcs.vcsId } };
+    }
+
+    const detectedVcsId = isVcsReviewInput(input)
+      ? resolveDetectedVcsIdWithExtensions(cwd, applied.vcsCatalog, configured.explicitVcsId)
+      : undefined;
+    if (detectedVcsId !== undefined && detectedVcsId !== input.options.vcs) {
+      input = { ...input, options: { ...input.options, vcs: detectedVcsId } };
+    }
+
+    const bootstrap = (await loadAppBootstrapImpl(input, {
+      ...(loadAtCwd ? { cwd } : {}),
+      customThemes: sessionThemes.themes,
+      vcsCatalog: applied.vcsCatalog,
+    })) as AppBootstrap;
+    bootstrap.changeset = await applyExtensionChangesetTransforms(extensions, bootstrap.changeset);
+    bootstrap.initialThemeMode = initialThemeMode ?? bootstrap.initialThemeMode;
+    bootstrap.extensions = extensions;
+    bootstrap.viewPreferencesConfigPath = configured.viewPreferencesConfigPath;
+    bootstrap.keybindings = configured.keybindings;
+
+    return { applied, bootstrap, input, previousFileLanguages, sessionThemes, sessionVcs };
+  } catch (error) {
+    restoreFileLanguageRegistrations(previousFileLanguages);
+    throw error;
   }
-
-  const detectedVcsId = resolveDetectedVcsIdWithExtensions(
-    cwd,
-    applied.vcsAdapters,
-    configured.explicitVcsId,
-  );
-  if (detectedVcsId !== undefined && detectedVcsId !== input.options.vcs) {
-    input = { ...input, options: { ...input.options, vcs: detectedVcsId } };
-  }
-
-  const bootstrap = await loadAppBootstrapImpl(input, {
-    ...(loadAtCwd ? { cwd } : {}),
-    customThemes: sessionThemes.themes,
-    vcsAdapters: applied.vcsAdapters,
-  });
-  bootstrap.changeset = await applyExtensionChangesetTransforms(extensions, bootstrap.changeset);
-  bootstrap.initialThemeMode = initialThemeMode ?? bootstrap.initialThemeMode;
-  bootstrap.extensions = extensions;
-  bootstrap.viewPreferencesConfigPath = configured.viewPreferencesConfigPath;
-  bootstrap.keybindings = configured.keybindings;
-
-  return { applied, bootstrap, input, sessionThemes, sessionVcs };
 }

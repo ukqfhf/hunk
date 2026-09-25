@@ -15,6 +15,7 @@ import {
   binaryFilenameForSpec,
   buildOptionalDependencyMap,
   buildPlatformPackageManifest,
+  buildPrebuiltRuntimeDependencies,
   getHostPlatformPackageSpec,
   getPlatformPackageSpecByName,
   releaseNpmDir,
@@ -36,6 +37,7 @@ type RootPackageJson = {
   exports?: unknown;
   dependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
 };
 
 interface BinaryArtifactMetadata {
@@ -105,8 +107,9 @@ function stageMetaPackage(
     homepage: rootPackage.homepage,
     bugs: rootPackage.bugs,
     engines: rootPackage.engines,
-    dependencies: rootPackage.dependencies,
+    dependencies: buildPrebuiltRuntimeDependencies(rootPackage.dependencies),
     peerDependencies: rootPackage.peerDependencies,
+    peerDependenciesMeta: rootPackage.peerDependenciesMeta,
     optionalDependencies: buildOptionalDependencyMap(rootPackage.version, specs),
     license: rootPackage.license,
     publishConfig: {

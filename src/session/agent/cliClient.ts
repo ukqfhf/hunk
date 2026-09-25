@@ -1,20 +1,34 @@
 import { sanitizeTerminalText } from "../../lib/terminalText";
 import { resolveSessionBrokerConfig } from "../broker/brokerConfig";
+import {
+  SessionBrokerCallerClient,
+  type SessionBrokerSignedRequestInit,
+} from "@hunk/session-broker";
 import type { SessionTerminalLocation, SessionTerminalMetadata } from "@hunk/session-broker-core";
-import { readHunkSessionDaemonCapabilities } from "../client/capabilities";
 import {
   HUNK_SESSION_DAEMON_HTTP_TIMEOUT_MS,
-  requestSessionDaemonHttp,
+  withSessionDaemonHttpTimeout,
 } from "../client/daemonHttp";
+import { loadOrCreateHunkSessionBrokerCredentials } from "../broker/credentials";
+import {
+  HUNK_SESSION_BROKER_APP_ID,
+  HUNK_SESSION_BROKER_APP_REVISION,
+} from "../broker/appContract";
 import {
   HUNK_SESSION_API_PATH,
+  HUNK_SESSION_CAPABILITIES_PATH,
+  type SessionDaemonAction,
   type SessionDaemonCapabilities,
   type SessionDaemonRequest,
+  type SessionDaemonResponses,
 } from "../protocol";
+import { parseSessionDaemonCapabilities, parseSessionDaemonResponse } from "../protocolSchemas";
 import type {
   AppliedCommentBatchResult,
   AppliedCommentResult,
+  AppliedHighlightResult,
   ClearedCommentsResult,
+  ClearedHighlightsResult,
   ListedSession,
   NavigatedSelectionResult,
   ReloadedSessionResult,
@@ -30,11 +44,13 @@ import type {
   SessionCommentClearCommandInput,
   SessionCommentListCommandInput,
   SessionCommentRemoveCommandInput,
+  SessionHighlightAddCommandInput,
+  SessionHighlightClearCommandInput,
   SessionNavigateCommandInput,
   SessionReloadCommandInput,
   SessionReviewCommandInput,
   SessionSelectorInput,
-} from "../../core/types";
+} from "../../core/run/commandInputs";
 import { describeSessionSelector } from "@hunk/session-broker-core";
 
 export interface HunkSessionCliClient {
@@ -52,6 +68,8 @@ export interface HunkSessionCliClient {
   ): Promise<Array<SessionLiveCommentSummary | SessionReviewNoteSummary>>;
   removeComment(input: SessionCommentRemoveCommandInput): Promise<RemovedCommentResult>;
   clearComments(input: SessionCommentClearCommandInput): Promise<ClearedCommentsResult>;
+  addHighlight(input: SessionHighlightAddCommandInput): Promise<AppliedHighlightResult>;
+  clearHighlights(input: SessionHighlightClearCommandInput): Promise<ClearedHighlightsResult>;
 }
 
 async function extractResponseError(response: Response) {
@@ -67,55 +85,103 @@ async function extractResponseError(response: Response) {
   return response.statusText || "Unknown Hunk session daemon error.";
 }
 
+interface HunkCallerTransport {
+  request(
+    path: string,
+    init?: SessionBrokerSignedRequestInit,
+    options?: { readonly targetSpecific?: boolean },
+  ): Promise<Response>;
+}
+
 class HttpHunkSessionCliClient implements HunkSessionCliClient {
   private readonly config = resolveSessionBrokerConfig();
+  private callerPromise: Promise<HunkCallerTransport> | null = null;
 
-  constructor(private readonly timeoutMs = HUNK_SESSION_DAEMON_HTTP_TIMEOUT_MS) {}
+  constructor(
+    private readonly timeoutMs = HUNK_SESSION_DAEMON_HTTP_TIMEOUT_MS,
+    private readonly injectedCaller?: HunkCallerTransport,
+  ) {}
 
-  private async request<ResultType>(input: SessionDaemonRequest) {
-    return requestSessionDaemonHttp({
-      config: this.config,
-      path: HUNK_SESSION_API_PATH,
+  private caller() {
+    if (this.injectedCaller) return Promise.resolve(this.injectedCaller);
+    this.callerPromise ??= loadOrCreateHunkSessionBrokerCredentials().then(
+      (credentials) =>
+        new SessionBrokerCallerClient({
+          appId: HUNK_SESSION_BROKER_APP_ID,
+          appRevision: HUNK_SESSION_BROKER_APP_REVISION,
+          origin: this.config.httpOrigin,
+          credential: credentials.caller,
+          daemon: {
+            keyId: credentials.daemonIdentity.keyId,
+            publicKey: credentials.daemonPublicKey,
+          },
+        }),
+    );
+    return this.callerPromise;
+  }
+
+  private async request<Action extends SessionDaemonAction>(
+    input: Extract<SessionDaemonRequest, { action: Action }>,
+  ): Promise<SessionDaemonResponses[Action]> {
+    return withSessionDaemonHttpTimeout({
       operation: `complete session ${input.action}`,
       timeoutMs: this.timeoutMs,
-      init: {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(input),
-      },
-      parse: async (response) => {
-        if (!response.ok) {
-          throw new Error(await extractResponseError(response));
+      task: async (signal) => {
+        const caller = await this.caller();
+        const response = await caller.request(
+          HUNK_SESSION_API_PATH,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(input),
+            signal,
+          },
+          { targetSpecific: input.action !== "list" },
+        );
+        if (!response.ok) throw new Error(await extractResponseError(response));
+        let value: unknown;
+        try {
+          value = await response.json();
+        } catch {
+          throw new Error(`Invalid Hunk session daemon response for ${input.action}.`);
         }
-
-        return (await response.json()) as ResultType;
+        return parseSessionDaemonResponse(input.action, value);
       },
     });
   }
 
   async getCapabilities() {
-    return readHunkSessionDaemonCapabilities(this.config, this.timeoutMs);
+    return withSessionDaemonHttpTimeout({
+      operation: "report capabilities",
+      timeoutMs: this.timeoutMs,
+      task: async (signal) => {
+        const response = await (
+          await this.caller()
+        ).request(HUNK_SESSION_CAPABILITIES_PATH, {
+          method: "GET",
+          signal,
+        });
+        if (!response.ok) return null;
+        return parseSessionDaemonCapabilities(await response.json());
+      },
+    });
   }
 
   async listSessions() {
-    return (await this.request<{ sessions: ListedSession[] }>({ action: "list" })).sessions;
+    return (await this.request({ action: "list" })).sessions;
   }
 
   async getSession(selector: SessionSelectorInput) {
-    return (await this.request<{ session: ListedSession }>({ action: "get", selector })).session;
+    return (await this.request({ action: "get", selector })).session;
   }
 
   async getSelectedContext(selector: SessionSelectorInput) {
-    return (
-      await this.request<{ context: SelectedSessionContext }>({ action: "context", selector })
-    ).context;
+    return (await this.request({ action: "context", selector })).context;
   }
 
   async getSessionReview(input: SessionReviewCommandInput) {
     return (
-      await this.request<{ review: SessionReview }>({
+      await this.request({
         action: "review",
         selector: input.selector,
         includePatch: input.includePatch,
@@ -126,7 +192,7 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
 
   async navigateToHunk(input: SessionNavigateCommandInput) {
     return (
-      await this.request<{ result: NavigatedSelectionResult }>({
+      await this.request({
         action: "navigate",
         selector: input.selector,
         filePath: input.filePath,
@@ -134,13 +200,14 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
         side: input.side,
         line: input.line,
         commentDirection: input.commentDirection,
+        commentId: input.commentId,
       })
     ).result;
   }
 
   async reloadSession(input: SessionReloadCommandInput) {
     return (
-      await this.request<{ result: ReloadedSessionResult }>({
+      await this.request({
         action: "reload",
         selector: input.selector,
         nextInput: input.nextInput,
@@ -151,7 +218,7 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
 
   async addComment(input: SessionCommentAddCommandInput) {
     return (
-      await this.request<{ result: AppliedCommentResult }>({
+      await this.request({
         action: "comment-add",
         selector: input.selector,
         filePath: input.filePath,
@@ -168,7 +235,7 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
 
   async applyComments(input: SessionCommentApplyCommandInput) {
     return (
-      await this.request<{ result: AppliedCommentBatchResult }>({
+      await this.request({
         action: "comment-apply",
         selector: input.selector,
         comments: input.comments,
@@ -179,20 +246,18 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
 
   async listComments(input: SessionCommentListCommandInput) {
     return (
-      await this.request<{ comments: Array<SessionLiveCommentSummary | SessionReviewNoteSummary> }>(
-        {
-          action: "comment-list",
-          selector: input.selector,
-          filePath: input.filePath,
-          type: input.type,
-        },
-      )
+      await this.request({
+        action: "comment-list",
+        selector: input.selector,
+        filePath: input.filePath,
+        type: input.type,
+      })
     ).comments;
   }
 
   async removeComment(input: SessionCommentRemoveCommandInput) {
     return (
-      await this.request<{ result: RemovedCommentResult }>({
+      await this.request({
         action: "comment-rm",
         selector: input.selector,
         commentId: input.commentId,
@@ -202,11 +267,37 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
 
   async clearComments(input: SessionCommentClearCommandInput) {
     return (
-      await this.request<{ result: ClearedCommentsResult }>({
+      await this.request({
         action: "comment-clear",
         selector: input.selector,
         filePath: input.filePath,
         includeUser: input.includeUser,
+      })
+    ).result;
+  }
+
+  async addHighlight(input: SessionHighlightAddCommandInput) {
+    return (
+      await this.request({
+        action: "highlight-add",
+        selector: input.selector,
+        filePath: input.filePath,
+        side: input.side,
+        line: input.line,
+        start: input.start,
+        end: input.end,
+        tone: input.tone,
+        reveal: input.reveal,
+      })
+    ).result;
+  }
+
+  async clearHighlights(input: SessionHighlightClearCommandInput) {
+    return (
+      await this.request({
+        action: "highlight-clear",
+        selector: input.selector,
+        filePath: input.filePath,
       })
     ).result;
   }
@@ -215,8 +306,9 @@ class HttpHunkSessionCliClient implements HunkSessionCliClient {
 /** Create the concrete Hunk session CLI client that speaks to the broker-backed HTTP API. */
 export function createHttpHunkSessionCliClient({
   timeoutMs,
-}: { timeoutMs?: number } = {}): HunkSessionCliClient {
-  return new HttpHunkSessionCliClient(timeoutMs);
+  caller,
+}: { timeoutMs?: number; caller?: HunkCallerTransport } = {}): HunkSessionCliClient {
+  return new HttpHunkSessionCliClient(timeoutMs, caller);
 }
 
 export function stringifyJson(value: unknown) {
@@ -426,6 +518,10 @@ export function formatNavigationOutput(
   selector: SessionSelectorInput,
   result: NavigatedSelectionResult,
 ) {
+  if (result.revealed === "line" && result.line !== undefined) {
+    return `Revealed ${formatSessionPath(result.filePath)}:${result.line} (${result.side}) in hunk ${result.hunkIndex + 1} of ${formatSessionSelector(selector)}.\n`;
+  }
+
   return `Focused ${formatSessionPath(result.filePath)} hunk ${result.hunkIndex + 1} in ${formatSessionSelector(selector)}.\n`;
 }
 
@@ -516,6 +612,45 @@ export function formatNoteListOutput(
       ].join("\n"),
     )
     .join("\n\n")}\n`;
+}
+
+/**
+ * Report one applied attention mark, including whether the review moved to it.
+ *
+ * The running mark count is part of the answer because marks accumulate per
+ * file: an agent that keeps marking needs to see its own total without asking.
+ */
+export function formatHighlightOutput(
+  selector: SessionSelectorInput,
+  result: AppliedHighlightResult,
+) {
+  const reveal =
+    result.revealed === "line"
+      ? " and revealed its line"
+      : result.revealed === "hunk"
+        ? " and revealed its hunk"
+        : "";
+  return (
+    `Marked ${formatSessionPath(result.filePath)}:${result.line} (${result.side}) ` +
+    `[${result.start}, ${result.end}) as ${result.tone} in ${formatSessionSelector(selector)}${reveal}. ` +
+    `File marks: ${result.fileMarkCount}.\n`
+  );
+}
+
+/**
+ * Report how many attention marks were cleared, and from what scope.
+ *
+ * Clearing is addressed either to one file or to the whole session, so the
+ * scope is named back to the caller rather than assumed.
+ */
+export function formatClearHighlightsOutput(
+  selector: SessionSelectorInput,
+  result: ClearedHighlightsResult,
+) {
+  const scope = result.filePath
+    ? `${formatSessionPath(result.filePath)} in ${formatSessionSelector(selector)}`
+    : formatSessionSelector(selector);
+  return `Cleared ${result.removedCount} attention marks from ${scope}. Remaining marks: ${result.remainingCount}.\n`;
 }
 
 export function formatClearCommentsOutput(

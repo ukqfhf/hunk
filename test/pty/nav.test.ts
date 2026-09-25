@@ -56,7 +56,7 @@ describe("PTY navigation", () => {
   test("real hunk navigation jumps to later hunks in the review stream", async () => {
     const fixture = harness.createMultiHunkFilePair();
     const session = await harness.launchHunk({
-      args: ["diff", fixture.before, fixture.after, "--mode", "split"],
+      args: ["diff", "--files", fixture.before, fixture.after, "--mode", "split"],
       cols: 104,
       rows: 12,
     });
@@ -134,7 +134,7 @@ describe("PTY navigation", () => {
   test("PTY sessions can navigate forward and backward between distant hunks in one large file", async () => {
     const fixture = harness.createMultiHunkFilePair();
     const session = await harness.launchHunk({
-      args: ["diff", fixture.before, fixture.after, "--mode", "split"],
+      args: ["diff", "--files", fixture.before, fixture.after, "--mode", "split"],
       cols: 104,
       rows: 12,
     });
@@ -192,7 +192,10 @@ describe("PTY navigation", () => {
       await session.click(/M delta\.ts\s+\+2 -1/);
       const jumped = await harness.waitForSnapshot(
         session,
-        (text) => text.includes("deltaOnly = true") && !text.includes("alphaOnly = true"),
+        (text) =>
+          text.includes("deltaOnly = true") &&
+          !text.includes("alphaOnly = true") &&
+          harness.countMatches(text, /epsilon\.ts/g) >= 2,
         5_000,
       );
 

@@ -37,6 +37,12 @@ write the character the shift produces (`"!"`, not `"shift+1"`), since that is
 what terminals report. `ctrl+<letter>` also matches an unnamed bare control
 byte; named Tab and Enter events stay distinct.
 
+Inline saved notes also expose clickable **Edit**, **Reply**, and (for reply-free user notes)
+**Delete** actions. `E` edits the first editable user note in the selected hunk and `R` replies
+to its first visible stored note. Replies inherit the code anchor and may be nested without a
+product depth limit. Static sidecar annotations are not reply targets, and a parent cannot be
+deleted until its replies are removed.
+
 The built-in commands and the keys they ship with:
 
 | Command id                                     | Does                                           | Default keys                 |
@@ -49,10 +55,11 @@ The built-in commands and the keys they ship with:
 | `hunk.review.alignCurrentLineBottom`           | Align current line to viewport bottom          | _(none)_                     |
 | `hunk.review.alignCurrentLineCenter`           | Center current line in viewport                | _(none)_                     |
 | `hunk.review.alignCurrentLineTop`              | Align current line to viewport top             | _(none)_                     |
+| `hunk.review.editActiveNote`                   | Edit the active review note                    | `E`                          |
 | `hunk.review.editSelectedFile`                 | Open the selected file in your editor          | `e`                          |
 | `hunk.review.focusFilter`                      | Focus the file filter                          | `/`                          |
-| `hunk.review.halfPageDown`                     | Scroll down half a page                        | `d`                          |
-| `hunk.review.halfPageUp`                       | Scroll up half a page                          | `u`                          |
+| `hunk.review.halfPageDown`                     | Scroll down half a page                        | `d`, `ctrl+d`                |
+| `hunk.review.halfPageUp`                       | Scroll up half a page                          | `u`, `ctrl+u`                |
 | `hunk.review.jumpToBottom`                     | Jump to end                                    | `G`, `end`                   |
 | `hunk.review.jumpToTop`                        | Jump to start                                  | `g`, `home`                  |
 | `hunk.review.nextAnnotatedFile`                | Next annotated file                            | _(none)_                     |
@@ -65,6 +72,7 @@ The built-in commands and the keys they ship with:
 | `hunk.review.previousAnnotatedHunk`            | Previous annotated hunk                        | `{`                          |
 | `hunk.review.previousFile`                     | Previous file                                  | `,`                          |
 | `hunk.review.previousHunk`                     | Previous hunk                                  | `[`                          |
+| `hunk.review.replyToActiveNote`                | Reply to the active review note                | `R`                          |
 | `hunk.review.scrollCodeLeft`                   | Scroll code left (shifted scrolls fast)        | `left`, `shift+left`         |
 | `hunk.review.scrollCodeRight`                  | Scroll code right (shifted scrolls fast)       | `right`, `shift+right`       |
 | `hunk.review.startNote`                        | Add a review note                              | `c`                          |
@@ -81,11 +89,19 @@ The built-in commands and the keys they ship with:
 | `hunk.view.openThemeSelector`                  | Choose theme                                   | `t`                          |
 | `hunk.view.toggleAgentNotes`                   | Toggle agent notes                             | `a`                          |
 | `hunk.view.toggleCopyDecorations`              | Toggle copy decorations                        | _(none)_                     |
+| `hunk.view.toggleFilesPane`                    | Toggle files pane                              | `s`                          |
 | `hunk.view.toggleHunkHeaders`                  | Toggle hunk headers                            | `m`                          |
 | `hunk.view.toggleLineNumbers`                  | Toggle line numbers                            | `l`                          |
 | `hunk.view.toggleLineWrap`                     | Toggle line wrapping                           | `w`                          |
 | `hunk.view.toggleMenuBar`                      | Toggle menu bar                                | `M`                          |
-| `hunk.view.toggleSidebar`                      | Toggle sidebar                                 | `s`                          |
+
+The files-pane command follows the named `hunk:files` role. If an extension
+replaces that role, the command and **View → Files pane** toggle the resolved
+replacement on any terminal edge without changing unrelated panes. Remapping or
+unbinding `hunk.view.toggleFilesPane` changes that role-aware action, not an
+extension pane's own commands. The former `hunk.view.toggleSidebar` id remains a
+compatibility alias; prefer the files-pane name in new config and extension
+code.
 
 Commands marked _(none)_ ship without a key: they remain callable by command id
 and can be assigned a shortcut through `[keybindings]`. Some also appear in a
@@ -97,9 +113,19 @@ present, so remapping something changes what they advertise. Unbinding a menu
 command keeps its menu item and simply stops showing a key.
 
 Extension commands are named `<extensionId>.<commandId>` and remap the same way
-(see [docs/extensions.md](extensions.md)). Keys that belong to a dialog,
+(see [docs/extensions.md](extensions.md)). An explicitly activated extension
+keyboard mode is a routing layer rather than a second command table: it may
+consume a key, pass it to these resolved bindings, or consume it and exit. Its
+multi-key grammar and counts are extension-owned, but resolved actions should
+invoke these same public `hunk.*` commands.
+
+Routing precedence is host prompts and dialogs, menus/overlays, focused text
+inputs, an interactive file-view mode, a session extension keyboard mode, then
+the command table and focused review widget. Keys that belong to a dialog,
 menu, or focused text input — `Esc`, `Enter`, `Ctrl-S` while writing a note —
-are part of those widgets rather than commands, and are not remappable.
+are part of those widgets rather than commands, and are not remappable. Escape
+is also the reserved exit from each active extension mode, so an extension
+cannot trap the keyboard.
 
 `[keybindings]` is read from your user config only — never from a repository's
 `.hunk/config.toml`. Which keys do what is a property of your keyboard and your
